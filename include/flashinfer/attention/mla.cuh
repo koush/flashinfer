@@ -338,7 +338,9 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
                                              const uint32_t kv_idx_base, const uint32_t qo_len,
                                              const uint32_t kv_len, const uint32_t kv_end,
                                              const uint_fastdiv num_heads,
-                                             typename KTraits::DTypeQKAccum (*s_frag)[8]) {
+                                             typename KTraits::DTypeQKAccum (*s_frag)[8],
+                                              const uint32_t cp_world_size, const uint32_t cp_rank,
+                                              const uint32_t causal_kv_len) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   using DTypeQKAccum = typename KTraits::DTypeQKAccum;
@@ -356,8 +358,9 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
         const uint32_t q_idx = q[(reg_id % 4) / 2],
                        kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
                                 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t causal_kv_idx = kv_idx * cp_world_size + cp_rank;
         const bool mask =
-            (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
+            (!(KTraits::CAUSAL ? (causal_kv_idx + qo_len > causal_kv_len + q_idx || (kv_idx >= kv_end))
                                : kv_idx >= kv_end));
         s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
@@ -370,8 +373,9 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
         const uint32_t q_idx = q[(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
                                                              2 * (lane_idx % 4) + 8 * (reg_id / 4) +
                                                              reg_id % 2;
+        const uint32_t causal_kv_idx = kv_idx * cp_world_size + cp_rank;
         const bool mask =
-            (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
+            (!(KTraits::CAUSAL ? (causal_kv_idx + qo_len > causal_kv_len + q_idx || (kv_idx >= kv_end))
                                : kv_idx >= kv_end));
         s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
@@ -906,11 +910,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 #pragma unroll 1
   for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
        ++work_idx) {
+    // Context parallelism: cp_world_size=0 means inactive, use 1/0/kv_len defaults.
+    const uint32_t cp_world_size = params.cp_world_size ? params.cp_world_size : 1u;
+    const uint32_t cp_rank = params.cp_world_size ? params.cp_rank : 0u;
+    const uint32_t causal_kv_len = params.kv_len[work_idx];
+
     const uint32_t q_indptr = params.q_indptr[work_idx];
     const uint32_t kv_indptr = params.kv_indptr[work_idx];
     const int32_t partial_indptr = params.partial_indptr[work_idx];
     const uint32_t q_len = params.q_len[work_idx];
-    const uint32_t kv_len = params.kv_len[work_idx];
+    const uint32_t kv_len = params.cp_world_size ? (params.kv_len[work_idx] / cp_world_size + (params.kv_len[work_idx] % cp_world_size > cp_rank)) : params.kv_len[work_idx];
     const uint32_t packed_qo_start = params.q_start[work_idx];
     const uint32_t kv_start = params.kv_start[work_idx];
     const uint32_t kv_end = params.kv_end[work_idx];
@@ -941,15 +950,30 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
     int kv_tile_idx =
         ceil_div(
-            (CAUSAL ? min(kv_end, kv_len - q_len + (packed_qo_start + cluster_tile_q) / num_heads)
+            (CAUSAL ? min(kv_end, causal_kv_len - q_len + (packed_qo_start + cluster_tile_q) / num_heads)
                     : kv_end),
             CTA_TILE_KV) -
         1 - (kv_start / CTA_TILE_KV);
 
-    int mask_tile_idx =
-        (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / num_heads) : kv_end) /
-            CTA_TILE_KV -
-        (kv_start / CTA_TILE_KV);
+    int mask_tile_idx;
+    if constexpr (CAUSAL) {
+      uint32_t mask_boundary_kv;
+      if (cp_world_size > 1) {
+        uint32_t q_first = packed_qo_start / num_heads;
+        int diff = (int)q_first + (int)causal_kv_len - (int)q_len - (int)cp_rank;
+        if (diff < 0) {
+          mask_boundary_kv = 0;
+        } else {
+          int last_attendable = diff / (int)cp_world_size;
+          mask_boundary_kv = min(kv_end, (uint32_t)(last_attendable + 1));
+        }
+      } else {
+        mask_boundary_kv = min(kv_end, causal_kv_len - q_len + packed_qo_start / num_heads);
+      }
+      mask_tile_idx = mask_boundary_kv / CTA_TILE_KV - (kv_start / CTA_TILE_KV);
+    } else {
+      mask_tile_idx = kv_end / CTA_TILE_KV - (kv_start / CTA_TILE_KV);
+    }
 
     uint32_t block_iter_base = kv_indptr * block_size + kv_start;
     // last kv tile
@@ -982,7 +1006,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
       // logits mask
       logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag);
+                            kv_end, num_heads, s_frag, cp_world_size, cp_rank, causal_kv_len);
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
@@ -1033,7 +1057,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
       logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag);
+                            kv_end, num_heads, s_frag, cp_world_size, cp_rank, causal_kv_len);
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,

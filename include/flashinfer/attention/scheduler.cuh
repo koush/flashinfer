@@ -956,6 +956,20 @@ inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int clu
              0);
 }
 
+inline int packed_causal_kv_end_cp(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
+                                   int num_qo_tiles, int num_heads,
+                                   int cp_world_size, int cp_rank, int global_kv_len) {
+  if (qo_tile_idx + 1 == num_qo_tiles) {
+    return kv_len;
+  }
+  int q_last_packed = (qo_tile_idx + 1) * cluster_tile_q - 1;
+  int q_last_pos = q_last_packed / num_heads;
+  if (q_last_pos >= qo_len) q_last_pos = qo_len - 1;
+  int global_kv_boundary = (global_kv_len - qo_len) + q_last_pos;
+  int local_kv_boundary = (global_kv_boundary >= cp_rank) ? (global_kv_boundary - cp_rank) / cp_world_size + 1 : 0;
+  return min(kv_len, max(local_kv_boundary, 0));
+}
+
 struct PrefillPlanSM90Info {
   int64_t qo_tile_indices_offset;
   int64_t qo_indptr_offset;
@@ -1062,9 +1076,9 @@ inline cudaError_t PrefillSM90Plan(
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
-  for (int qo_head_idx = 0;
-       qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
-    for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
+   for (int qo_head_idx = 0;
+        qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
+   for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
       int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
         auto [cta_idx, accum_cost] = cta_cost_heap.pop();
@@ -1580,7 +1594,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                            size_t int_workspace_size_in_bytes, MLAPlanInfo& plan_info,
                            IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
                            uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-                           bool causal, cudaStream_t stream) {
+                           bool causal, cudaStream_t stream = 0,
+                           uint32_t cp_world_size = 0, uint32_t cp_rank = 0) {
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1588,7 +1603,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   // step 0. determine the number of blocks in x and y dimensions
   int accum_packed_qo_len = 0;
-  std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec;
+  std::vector<std::tuple<int, int, int, int>> idx_qo_kv_len_vec;
   for (uint32_t i = 0; i < batch_size; ++i) {
     if (qo_indptr_h[i + 1] - qo_indptr_h[i] < 0) {
       std::ostringstream err_msg;
@@ -1601,8 +1616,9 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int packed_qo_len = qo_len * num_heads;
     accum_packed_qo_len += packed_qo_len;
 
-    int kv_len = kv_len_arr_h[i];
-    idx_qo_kv_len_vec.push_back({i, qo_len, kv_len});
+    int kv_len = cp_world_size ? (kv_len_arr_h[i] / cp_world_size + (kv_len_arr_h[i] % cp_world_size > cp_rank)) : kv_len_arr_h[i];
+    int global_kv_len = kv_len_arr_h[i];
+    idx_qo_kv_len_vec.push_back({i, qo_len, kv_len, global_kv_len});
   }
   int avg_packed_qo_len = accum_packed_qo_len / batch_size;
 
@@ -1619,13 +1635,21 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int cluster_tile_q = cluster_size * cta_tile_q;
 
   int64_t total_kv_lens = 0;
-  for (auto& [_, qo_len, kv_len] : idx_qo_kv_len_vec) {
+  for (auto& [_, qo_len, kv_len, global_kv_len] : idx_qo_kv_len_vec) {
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int effective_kv_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
-                                                           cluster_tile_q, num_qo_tiles, num_heads)
-                                    : kv_len;
+      int effective_kv_len;
+      if (causal) {
+        effective_kv_len = (cp_world_size > 0)
+            ? packed_causal_kv_end_cp(qo_len, kv_len, qo_tile_idx,
+                                     cluster_tile_q, num_qo_tiles, num_heads,
+                                     cp_world_size, cp_rank, global_kv_len)
+            : packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
+                                  cluster_tile_q, num_qo_tiles, num_heads);
+      } else {
+        effective_kv_len = kv_len;
+      }
       total_kv_lens += effective_kv_len;
     }
   }
@@ -1663,13 +1687,21 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int merge_cta_counter = 0;
   int partial_o_nnz = 0;
 
-  for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
+  for (auto& [i, qo_len, kv_len, global_kv_len] : idx_qo_kv_len_vec) {
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int remaining_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
-                                                        num_qo_tiles, num_heads)
-                                 : kv_len;
+      int remaining_len;
+      if (causal) {
+        remaining_len = (cp_world_size > 0)
+            ? packed_causal_kv_end_cp(qo_len, kv_len, qo_tile_idx,
+                                     cluster_tile_q, num_qo_tiles, num_heads,
+                                     cp_world_size, cp_rank, global_kv_len)
+            : packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
+                                  cluster_tile_q, num_qo_tiles, num_heads);
+      } else {
+        remaining_len = kv_len;
+      }
       int kv_start = 0;
       bool split_kv = remaining_len > kv_len_limit;
       int row_tile_size = std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
@@ -1712,7 +1744,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_cost_heap.insert(
             {cluster_idx, accum_cost + cost_function(cluster_tile_q, actual_len)});
         cluster_q_len[cluster_idx].push_back(qo_len);
-        cluster_kv_len[cluster_idx].push_back(kv_len);
+        cluster_kv_len[cluster_idx].push_back(global_kv_len);
         cluster_q_indptr[cluster_idx].push_back(qo_indptr_h[i]);
         cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
         if (split_kv) {

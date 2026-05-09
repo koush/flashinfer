@@ -77,6 +77,13 @@ struct MLAParams {
   float ckv_scale = 1.f;
   float kpe_scale = 1.f;
   bool return_lse_base_on_e;
+
+  // Context parallelism: causal mask correction for token-level interleaved KV shards.
+  // When cp_world_size == 0, CP is inactive and the kernel uses original causal mask logic.
+  // When cp_world_size > 0, global_kv_idx = kv_idx * cp_world_size + cp_rank replaces
+  // kv_idx in causal comparisons, and cp_kv_len replaces kv_len.
+  uint32_t cp_world_size;
+  uint32_t cp_rank;
 };
 
 };  // namespace flashinfer
