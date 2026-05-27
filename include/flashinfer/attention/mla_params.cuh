@@ -84,6 +84,39 @@ struct MLAParams {
   // kv_idx in causal comparisons, and cp_kv_len replaces kv_len.
   uint32_t cp_world_size;
   uint32_t cp_rank;
+
+  // Custom attention mask (packed bitmask, little-endian bit order).
+  // For MaskMode::kCustom:
+  //   The mask has shape [qo_len, global_kv_len] flattened and bit-packed.
+  //   Bit (q_idx * global_kv_len + kv_idx) is at byte offset / 8, bit position % 8.
+  //   A set bit (1) means the position is allowed (not masked), 0 means masked out.
+  // For MaskMode::kCausalCustom:
+  //   The mask has shape [qo_len, mask_kv_len] flattened and bit-packed, covering
+  //   the last mask_kv_len tokens of the KV sequence (which may include both existing
+  //   KV cache tokens and new prefill tokens). Positions before (causal_kv_len -
+  //   mask_kv_len) are always attended (causal is trivially satisfied).
+  //   For kv positions >= prefix_len (= causal_kv_len - mask_kv_len), the mask is
+  //   looked up at:
+  //     offset = q_idx * mask_kv_len + (global_kv_idx - prefix_len)
+  //   When maybe_mask_kv_len is nullptr, mask_kv_len defaults to qo_len (the mask
+  //   covers only the prefill tokens, which is the original kCausalCustom behavior).
+  //   When maybe_mask_kv_len is provided, mask_kv_len can be larger than qo_len,
+  //   allowing the mask to extend into the most recent KV cache tokens.
+  // maybe_custom_mask: pointer to packed uint8 bitmask array, or nullptr.
+  // maybe_mask_indptr: pointer to int32/64 array of shape [batch_size + 1], or nullptr.
+  //   maybe_mask_indptr[batch_idx] gives the byte offset into maybe_custom_mask for that request.
+  // maybe_mask_kv_len: per-batch mask width for kCausalCustom, or nullptr.
+  //   maybe_mask_kv_len[batch_idx] gives the number of KV columns in the mask for that request.
+  //   Only used by kCausalCustom; ignored by kCustom (which uses causal_kv_len as width).
+  // When nullptr, custom masking is not applied (only causal/no-mask is used based on MASK_MODE).
+  uint8_t* maybe_custom_mask = nullptr;
+  IdType* maybe_mask_indptr = nullptr;
+  IdType* maybe_mask_kv_len = nullptr;
+
+  // batch_indices: pointer to int32/64 array of shape [total_num_works].
+  //   batch_indices[work_idx] gives the original batch index for this work item.
+  //   Used for custom mask indptr lookup since work items may be reordered by the scheduler.
+  IdType* batch_indices = nullptr;
 };
 
 };  // namespace flashinfer

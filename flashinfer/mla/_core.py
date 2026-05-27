@@ -38,6 +38,7 @@ from ..trace.templates.attention import (
 )
 from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..jit.mla import gen_mla_module
+from ..quantization import packbits, segment_packbits
 from ..utils import (
     MaskMode,
     _check_block_tables_shape,
@@ -1685,6 +1686,10 @@ class BatchMLAPagedAttentionWrapper:
         self._q_data_type = q_data_type
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
+        self._custom_mask_buf = None
+        self._mask_indptr_buf = None
+        self._mask_kv_len_buf = None
+        self._is_causal_custom = False
 
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
@@ -1756,6 +1761,10 @@ class BatchMLAPagedAttentionWrapper:
         *,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -1804,6 +1813,31 @@ class BatchMLAPagedAttentionWrapper:
             Per-tensor dequantization scale for the rope-K cache when
             ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
             usage rules as ``ckv_scale``.
+        custom_mask : Optional[torch.Tensor]
+            A boolean tensor of shape ``[total_qo_len, max_kv_len]`` for custom attention masking.
+            A ``True`` value means the position is allowed (not masked), ``False`` means masked out.
+            Cannot be used together with ``packed_custom_mask`` or ``causal_custom_mask``.
+            When provided, ``causal`` in plan should be ``False`` for arbitrary masks,
+            or ``True`` if the custom mask is a subset of the causal mask.
+        packed_custom_mask : Optional[torch.Tensor]
+            A pre-packed uint8 tensor (via ``torch.packbits``) of the custom attention mask.
+            Cannot be used together with ``custom_mask`` or ``causal_custom_mask``.
+            When provided, ``causal`` in plan should be ``False`` for arbitrary masks,
+            or ``True`` if the custom mask is a subset of the causal mask.
+        causal_custom_mask : Optional[torch.Tensor]
+            A pre-packed uint8 tensor of a custom attention mask for the suffix (prefill) tokens only.
+            The mask has shape ``[batch_size, qo_len, qo_len]`` flattened and bit-packed,
+            covering only the prefill tokens among themselves. Causal mask is automatically
+            applied for existing KV cache positions (prefix_len = kv_len - qo_len).
+            Cannot be used together with ``custom_mask`` or ``packed_custom_mask``.
+            The ``causal`` flag in ``plan()`` should be ``True``.
+        causal_custom_mask_kv_len : Optional[torch.Tensor]
+            Per-batch mask width (number of KV columns) for ``causal_custom_mask``, shape ``[batch_size]``, int32.
+            When provided, the mask has shape ``[batch_size, qo_len, mask_kv_len[i]]`` per batch,
+            covering the last ``mask_kv_len[i]`` tokens of the KV sequence (which may include both
+            existing KV cache tokens and new prefill tokens). When ``mask_kv_len > qo_len``, the mask
+            extends into the most recent KV cache tokens. When not provided, defaults to ``qo_len``
+            (mask covers only the prefill tokens, the original behavior).
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -1922,7 +1956,82 @@ class BatchMLAPagedAttentionWrapper:
         page_size = self._page_size
         sm_scale = self._sm_scale
         causal = self._causal
-        mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+
+        if custom_mask is not None and packed_custom_mask is not None:
+            raise ValueError("Cannot specify both custom_mask and packed_custom_mask")
+        if custom_mask is not None and causal_custom_mask is not None:
+            raise ValueError("Cannot specify both custom_mask and causal_custom_mask")
+        if packed_custom_mask is not None and causal_custom_mask is not None:
+            raise ValueError("Cannot specify both packed_custom_mask and causal_custom_mask")
+
+        if custom_mask is not None or packed_custom_mask is not None:
+            qo_indptr_host = self._qo_indptr_buf.cpu() if self._qo_indptr_buf.is_cuda else self._qo_indptr_buf
+            kv_len_arr_host = self._kv_len_arr_buf.cpu() if self._kv_len_arr_buf.is_cuda else self._kv_len_arr_buf
+            batch_size = qo_indptr_host.shape[0] - 1
+            mask_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
+            for i in range(batch_size):
+                qo_len = qo_indptr_host[i + 1].item() - qo_indptr_host[i].item()
+                kv_len_i = kv_len_arr_host[i].item()
+                mask_indptr[i + 1] = mask_indptr[i].item() + qo_len * kv_len_i
+            mask_indptr = mask_indptr.to(self.device)
+
+        if causal_custom_mask is not None:
+            qo_indptr_host = self._qo_indptr_buf.cpu() if self._qo_indptr_buf.is_cuda else self._qo_indptr_buf
+            batch_size = qo_indptr_host.shape[0] - 1
+            # mask_indptr stores byte offsets into the packed mask buffer.
+            # Each batch has qo_len * mask_kv_len bits packed into ceil(bits/8) bytes.
+            # When causal_custom_mask_kv_len is provided, mask_kv_len can be larger than
+            # qo_len, allowing the mask to extend into the most recent KV cache tokens.
+            # When not provided, mask_kv_len defaults to qo_len (original behavior).
+            mask_kv_len_host = None
+            if causal_custom_mask_kv_len is not None:
+                mask_kv_len_host = causal_custom_mask_kv_len.cpu() if causal_custom_mask_kv_len.is_cuda else causal_custom_mask_kv_len
+            mask_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
+            for i in range(batch_size):
+                qo_len = qo_indptr_host[i + 1].item() - qo_indptr_host[i].item()
+                mkl = mask_kv_len_host[i].item() if mask_kv_len_host is not None else qo_len
+                num_bits = qo_len * mkl
+                mask_indptr[i + 1] = mask_indptr[i].item() + (num_bits + 7) // 8
+            mask_indptr = mask_indptr.to(self.device)
+
+        if custom_mask is not None:
+            if custom_mask.dtype != torch.bool:
+                raise ValueError(f"custom_mask must be bool dtype, got {custom_mask.dtype}")
+            packed_custom_mask, mask_indptr = segment_packbits(
+                custom_mask.contiguous().view(-1).to(self.device),
+                mask_indptr,
+                bitorder="little",
+            )
+            self._custom_mask_buf = packed_custom_mask
+            self._mask_indptr_buf = mask_indptr
+            self._is_causal_custom = False
+        elif packed_custom_mask is not None:
+            if packed_custom_mask.dtype != torch.uint8:
+                raise ValueError(f"packed_custom_mask must be uint8 dtype, got {packed_custom_mask.dtype}")
+            self._custom_mask_buf = packed_custom_mask
+            self._mask_indptr_buf = mask_indptr
+            self._is_causal_custom = False
+        elif causal_custom_mask is not None:
+            if causal_custom_mask.dtype != torch.uint8:
+                raise ValueError(f"causal_custom_mask must be uint8 dtype, got {causal_custom_mask.dtype}")
+            self._custom_mask_buf = causal_custom_mask
+            self._mask_indptr_buf = mask_indptr
+            self._mask_kv_len_buf = causal_custom_mask_kv_len.to(self.device) if causal_custom_mask_kv_len is not None else None
+            self._is_causal_custom = True
+        else:
+            self._custom_mask_buf = None
+            self._mask_indptr_buf = None
+            self._mask_kv_len_buf = None
+            self._is_causal_custom = False
+
+        if self._custom_mask_buf is not None and self._is_causal_custom:
+            mask_mode = MaskMode.CAUSAL_CUSTOM.value
+        elif self._custom_mask_buf is not None:
+            mask_mode = MaskMode.CUSTOM.value
+        elif causal:
+            mask_mode = MaskMode.CAUSAL.value
+        else:
+            mask_mode = MaskMode.NON_CAUSAL.value
         device = self.device
         if out is None:
             out = torch.empty_like(q_nope)
@@ -1939,6 +2048,10 @@ class BatchMLAPagedAttentionWrapper:
                     lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
+        if self._custom_mask_buf is not None:
+            custom_mask_args = (self._custom_mask_buf, self._mask_indptr_buf, self._mask_kv_len_buf)
+        else:
+            custom_mask_args = (None, None, None)
         self._cached_module.run(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -1957,6 +2070,7 @@ class BatchMLAPagedAttentionWrapper:
             return_lse_base_on_e,
             ckv_scale_f,
             kpe_scale_f,
+            *custom_mask_args,
             *profiler_args,
         )
 

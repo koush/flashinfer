@@ -394,8 +394,8 @@ cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t s
   static_assert(cutlass::sizeof_bits_v<typename Params::DTypeQ> == 8);
   static_assert(cutlass::sizeof_bits_v<typename Params::DTypeKV> == 8);
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
+    return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   if constexpr (HEAD_DIM == 64) {
@@ -436,8 +436,8 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
 cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                       cudaStream_t stream) {
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
+    return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   if constexpr (HEAD_DIM == 64) {
@@ -556,8 +556,8 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
 cudaError_t BatchFP8PrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                        cudaStream_t stream) {
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
+    return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   if constexpr (HEAD_DIM == 64) {

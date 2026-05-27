@@ -19,10 +19,12 @@
 namespace flashinfer {
 
 enum class MaskMode {
-  kNone = 0U,    // No mask
-  kCausal = 1U,  // Causal mask
-  kCustom = 2U,  // Custom mask
+  kNone = 0U,             // No mask
+  kCausal = 1U,           // Causal mask
+  kCustom = 2U,           // Custom mask (mask covers full [qo_len, kv_len])
   kMultiItemScoring = 3U,
+  kCausalCustom = 4U,     // Causal for existing KV cache + custom mask for new tokens only
+                           // (mask covers [qo_len, numPrefillTokens] where numPrefillTokens = kv_len - prefix_len)
 };
 
 }  // namespace flashinfer

@@ -32,7 +32,10 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
                                TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
                                TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                int64_t num_heads, int64_t page_size, double sm_scale,
-                               bool return_lse_base_on_e, double ckv_scale, double kpe_scale) {
+                               bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
+                               Optional<TensorView> maybe_custom_mask,
+                               Optional<TensorView> maybe_mask_indptr,
+                               Optional<TensorView> maybe_mask_kv_len) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
@@ -63,7 +66,7 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, Params, [&] {
-        Params params;
+        Params params = {};
 
         params.q_nope = static_cast<DTypeQ*>(q_nope.data_ptr());
         params.q_pe = static_cast<DTypeQ*>(q_pe.data_ptr());
@@ -118,6 +121,22 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
         params.ckv_scale = static_cast<float>(ckv_scale);
         params.kpe_scale = static_cast<float>(kpe_scale);
         params.return_lse_base_on_e = return_lse_base_on_e;
+
+        params.maybe_custom_mask =
+            maybe_custom_mask.has_value()
+                ? static_cast<uint8_t*>(maybe_custom_mask.value().data_ptr())
+                : nullptr;
+        params.maybe_mask_indptr =
+            maybe_mask_indptr.has_value()
+                ? static_cast<IdType*>(maybe_mask_indptr.value().data_ptr())
+                : nullptr;
+        params.maybe_mask_kv_len =
+            maybe_mask_kv_len.has_value()
+                ? static_cast<IdType*>(maybe_mask_kv_len.value().data_ptr())
+                : nullptr;
+
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
 
         cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
             params, plan_info.num_blks_x, plan_info.num_blks_y, stream);

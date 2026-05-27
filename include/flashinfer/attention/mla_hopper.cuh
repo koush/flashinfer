@@ -1238,7 +1238,7 @@ cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
 
-  if (MASK_MODE == MaskMode::kCustom) {
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
     return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;

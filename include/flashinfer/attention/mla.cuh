@@ -68,11 +68,14 @@ struct SharedStorageQKVO {
   };
 };
 
-template <bool CAUSAL_, uint32_t NUM_STAGES_, bool QK_SHARD_, uint32_t HEAD_DIM_CKV_,
-          uint32_t HEAD_DIM_KPE_, uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_,
-          typename DTypeKV_, typename DTypeO_, typename IdType_>
+template <bool CAUSAL_, bool USE_CUSTOM_MASK_, bool USE_CAUSAL_CUSTOM_MASK_, uint32_t NUM_STAGES_, bool QK_SHARD_,
+           uint32_t HEAD_DIM_CKV_, uint32_t HEAD_DIM_KPE_, uint32_t CTA_TILE_Q_,
+           uint32_t CTA_TILE_KV_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_,
+           typename IdType_>
 struct KernelTraits {
   static constexpr bool CAUSAL = CAUSAL_;
+  static constexpr bool USE_CUSTOM_MASK = USE_CUSTOM_MASK_;
+  static constexpr bool USE_CAUSAL_CUSTOM_MASK = USE_CAUSAL_CUSTOM_MASK_;
   static constexpr uint32_t NUM_STAGES = NUM_STAGES_;
   // NOTE(Zihao): whether to shard Q*K computation across warpgroups
   // if true, each warpgroup will compute a subset of Q*K (sharded on the KV dimension)
@@ -340,7 +343,10 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
                                              const uint_fastdiv num_heads,
                                              typename KTraits::DTypeQKAccum (*s_frag)[8],
                                               const uint32_t cp_world_size, const uint32_t cp_rank,
-                                              const uint32_t causal_kv_len) {
+                                             const uint32_t causal_kv_len,
+                                             const uint8_t* custom_mask_ptr,
+                                             const uint32_t mask_kv_len,
+                                             const uint32_t prefix_len) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   using DTypeQKAccum = typename KTraits::DTypeQKAccum;
@@ -350,6 +356,10 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
     q[j] = (qo_packed_idx_base + warp_idx_in_wg * 16 + lane_idx / 4 + 8 * j) / num_heads;
   }
 
+  const uint32_t mask_total_bytes = (KTraits::USE_CUSTOM_MASK || KTraits::USE_CAUSAL_CUSTOM_MASK)
+                                         ? (qo_len * mask_kv_len + 7) / 8
+                                         : 0;
+
   if constexpr (KTraits::QK_SHARD) {
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
@@ -358,10 +368,33 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
         const uint32_t q_idx = q[(reg_id % 4) / 2],
                        kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
                                 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
-        const uint32_t causal_kv_idx = kv_idx * cp_world_size + cp_rank;
-        const bool mask =
-            (!(KTraits::CAUSAL ? (causal_kv_idx + qo_len > causal_kv_len + q_idx || (kv_idx >= kv_end))
-                               : kv_idx >= kv_end));
+        bool mask;
+        if constexpr (KTraits::USE_CUSTOM_MASK) {
+          const uint64_t global_kv_idx = cp_world_size > 0 ? (static_cast<uint64_t>(kv_idx) * cp_world_size + cp_rank) : static_cast<uint64_t>(kv_idx);
+          const uint64_t offset = static_cast<uint64_t>(q_idx) * mask_kv_len + global_kv_idx;
+          const uint32_t byte_offset = static_cast<uint32_t>(offset / 8);
+          mask = (q_idx < qo_len && kv_idx < kv_end && byte_offset < mask_total_bytes)
+                     ? ((custom_mask_ptr[byte_offset] >> (offset % 8)) & 1)
+                     : false;
+        } else if constexpr (KTraits::USE_CAUSAL_CUSTOM_MASK) {
+          const uint64_t global_kv_idx = cp_world_size > 0 ? (static_cast<uint64_t>(kv_idx) * cp_world_size + cp_rank) : static_cast<uint64_t>(kv_idx);
+          if (global_kv_idx < prefix_len) {
+            // Prefix positions: always attend (causal mask is trivially satisfied)
+            mask = !(kv_idx >= kv_end);
+          } else {
+            // Suffix positions: look up custom mask
+            const uint64_t offset = static_cast<uint64_t>(q_idx) * mask_kv_len + (global_kv_idx - prefix_len);
+            const uint32_t byte_offset = static_cast<uint32_t>(offset / 8);
+            mask = (q_idx < qo_len && kv_idx < kv_end && byte_offset < mask_total_bytes)
+                       ? ((custom_mask_ptr[byte_offset] >> (offset % 8)) & 1)
+                       : false;
+          }
+        } else if constexpr (KTraits::CAUSAL) {
+          const uint32_t causal_kv_idx = cp_world_size > 0 ? (kv_idx * cp_world_size + cp_rank) : kv_idx;
+          mask = !(causal_kv_idx + qo_len > causal_kv_len + q_idx || kv_idx >= kv_end);
+        } else {
+          mask = !(kv_idx >= kv_end);
+        }
         s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
     }
@@ -371,12 +404,35 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
         const uint32_t q_idx = q[(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
-                                                             2 * (lane_idx % 4) + 8 * (reg_id / 4) +
-                                                             reg_id % 2;
-        const uint32_t causal_kv_idx = kv_idx * cp_world_size + cp_rank;
-        const bool mask =
-            (!(KTraits::CAUSAL ? (causal_kv_idx + qo_len > causal_kv_len + q_idx || (kv_idx >= kv_end))
-                               : kv_idx >= kv_end));
+                                                         2 * (lane_idx % 4) + 8 * (reg_id / 4) +
+                                                         reg_id % 2;
+        bool mask;
+        if constexpr (KTraits::USE_CUSTOM_MASK) {
+          const uint64_t global_kv_idx = cp_world_size > 0 ? (static_cast<uint64_t>(kv_idx) * cp_world_size + cp_rank) : static_cast<uint64_t>(kv_idx);
+          const uint64_t offset = static_cast<uint64_t>(q_idx) * mask_kv_len + global_kv_idx;
+          const uint32_t byte_offset = static_cast<uint32_t>(offset / 8);
+          mask = (q_idx < qo_len && kv_idx < kv_end && byte_offset < mask_total_bytes)
+                     ? ((custom_mask_ptr[byte_offset] >> (offset % 8)) & 1)
+                     : false;
+        } else if constexpr (KTraits::USE_CAUSAL_CUSTOM_MASK) {
+          const uint64_t global_kv_idx = cp_world_size > 0 ? (static_cast<uint64_t>(kv_idx) * cp_world_size + cp_rank) : static_cast<uint64_t>(kv_idx);
+          if (global_kv_idx < prefix_len) {
+            // Prefix positions: always attend (causal mask is trivially satisfied)
+            mask = !(kv_idx >= kv_end);
+          } else {
+            // Suffix positions: look up custom mask
+            const uint64_t offset = static_cast<uint64_t>(q_idx) * mask_kv_len + (global_kv_idx - prefix_len);
+            const uint32_t byte_offset = static_cast<uint32_t>(offset / 8);
+            mask = (q_idx < qo_len && kv_idx < kv_end && byte_offset < mask_total_bytes)
+                       ? ((custom_mask_ptr[byte_offset] >> (offset % 8)) & 1)
+                       : false;
+          }
+        } else if constexpr (KTraits::CAUSAL) {
+          const uint32_t causal_kv_idx = cp_world_size > 0 ? (kv_idx * cp_world_size + cp_rank) : kv_idx;
+          mask = !(causal_kv_idx + qo_len > causal_kv_len + q_idx || kv_idx >= kv_end);
+        } else {
+          mask = !(kv_idx >= kv_end);
+        }
         s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
       }
     }
@@ -924,6 +980,31 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     const uint32_t kv_start = params.kv_start[work_idx];
     const uint32_t kv_end = params.kv_end[work_idx];
 
+    const uint8_t* custom_mask_ptr = nullptr;
+    uint32_t mask_kv_len = 0;
+    uint32_t prefix_len_val = 0;
+    if constexpr (KTraits::USE_CUSTOM_MASK) {
+      if (params.maybe_custom_mask && params.maybe_mask_indptr) {
+        const uint32_t batch_idx = params.batch_indices[work_idx];
+        custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
+      }
+      mask_kv_len = causal_kv_len;
+    } else if constexpr (KTraits::USE_CAUSAL_CUSTOM_MASK) {
+      if (params.maybe_custom_mask && params.maybe_mask_indptr) {
+        const uint32_t batch_idx = params.batch_indices[work_idx];
+        custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
+        // mask_kv_len: width of the custom mask. When maybe_mask_kv_len is provided,
+        // it can be larger than q_len, allowing the mask to extend into the most
+        // recent KV cache tokens. When null, defaults to q_len (original behavior).
+        mask_kv_len = params.maybe_mask_kv_len ? params.maybe_mask_kv_len[batch_idx] : q_len;
+      } else {
+        mask_kv_len = q_len;
+      }
+      // prefix_len: positions before this are always attended (causal is trivially
+      // satisfied). The mask covers the last mask_kv_len tokens of the KV sequence.
+      prefix_len_val = causal_kv_len > mask_kv_len ? causal_kv_len - mask_kv_len : 0;
+    }
+
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
     const uint32_t qo_upperbound =
         min(q_len, ceil_div(qo_packed_idx_base + KTraits::CTA_TILE_Q, num_heads));
@@ -971,6 +1052,20 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         mask_boundary_kv = min(kv_end, causal_kv_len - q_len + packed_qo_start / num_heads);
       }
       mask_tile_idx = mask_boundary_kv / CTA_TILE_KV - (kv_start / CTA_TILE_KV);
+    } else if constexpr (KTraits::USE_CUSTOM_MASK) {
+      mask_tile_idx = 0;
+    } else if constexpr (KTraits::USE_CAUSAL_CUSTOM_MASK) {
+      // For causal-custom, deep-prefix tiles (positions < prefix_len_val) don't need
+      // masking (causal is trivially satisfied), but mask-region tiles need custom
+      // masking. Find the first tile containing a mask-region position.
+      // prefix_len_val = causal_kv_len - mask_kv_len, so when mask_kv_len > q_len,
+      // the mask region extends into the KV cache and prefix_len_val shrinks accordingly.
+      // Use floor division (same as the CAUSAL branch above) so the boundary tile — which
+      // straddles deep-prefix and mask-region — is included in the masked loop, not the
+      // unmasked loop. ceil_div would point one tile past the boundary, leaving OOB
+      // positions unguarded.
+      uint32_t prefix_tile_end = min(prefix_len_val, kv_end) / CTA_TILE_KV;
+      mask_tile_idx = prefix_tile_end - (kv_start / CTA_TILE_KV);
     } else {
       mask_tile_idx = kv_end / CTA_TILE_KV - (kv_start / CTA_TILE_KV);
     }
@@ -1006,7 +1101,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
       // logits mask
       logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag, cp_world_size, cp_rank, causal_kv_len);
+                            kv_end, num_heads, s_frag, cp_world_size, cp_rank, causal_kv_len,
+                            custom_mask_ptr, mask_kv_len, prefix_len_val);
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
@@ -1057,7 +1153,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
       logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag, cp_world_size, cp_rank, causal_kv_len);
+                            kv_end, num_heads, s_frag, cp_world_size, cp_rank, causal_kv_len,
+                            custom_mask_ptr, mask_kv_len, prefix_len_val);
 
       // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
@@ -1123,10 +1220,9 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;
-  }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr bool USE_CUSTOM_MASK = MASK_MODE == MaskMode::kCustom;
+  constexpr bool USE_CAUSAL_CUSTOM_MASK = MASK_MODE == MaskMode::kCausalCustom;
 
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(32, 4, 2);
@@ -1138,7 +1234,7 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
-    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
+    using KTraits = KernelTraits<CAUSAL, USE_CUSTOM_MASK, USE_CAUSAL_CUSTOM_MASK, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
                                  /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
     auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;

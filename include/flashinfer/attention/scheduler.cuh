@@ -1537,6 +1537,7 @@ struct MLAPlanInfo {
   int64_t kv_start_offset;
   int64_t kv_end_offset;
   int64_t work_indptr_offset;
+  int64_t batch_indices_offset;
   int64_t partial_o_offset;
   int64_t partial_lse_offset;
 
@@ -1557,14 +1558,15 @@ struct MLAPlanInfo {
             kv_start_offset,
             kv_end_offset,
             work_indptr_offset,
+            batch_indices_offset,
             partial_o_offset,
             partial_lse_offset};
   }
 
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 18) {
+    if (vec.size() != 19) {
       std::ostringstream err_msg;
-      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 18, but got " << vec.size();
+      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     num_blks_x = vec[0];
@@ -1583,8 +1585,9 @@ struct MLAPlanInfo {
     kv_start_offset = vec[13];
     kv_end_offset = vec[14];
     work_indptr_offset = vec[15];
-    partial_o_offset = vec[16];
-    partial_lse_offset = vec[17];
+    batch_indices_offset = vec[16];
+    partial_o_offset = vec[17];
+    partial_lse_offset = vec[18];
   }
 };
 
@@ -1678,7 +1681,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       cluster_q_start(num_clusters, std::vector<IdType>()),
       cluster_kv_start(num_clusters, std::vector<IdType>()),
       cluster_kv_end(num_clusters, std::vector<IdType>()),
-      cluster_partial_indptr(num_clusters, std::vector<IdType>());
+      cluster_partial_indptr(num_clusters, std::vector<IdType>()),
+      cluster_batch_indices(num_clusters, std::vector<IdType>());
 
   std::vector<IdType> merge_packed_offset_start(num_sm, 0), merge_packed_offset_end(num_sm, 0),
       merge_partial_packed_offset_start(num_sm, 0), merge_partial_packed_offset_end(num_sm, 0),
@@ -1756,6 +1760,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
         cluster_kv_start[cluster_idx].push_back(kv_start);
         cluster_kv_end[cluster_idx].push_back(kv_start + actual_len);
+        cluster_batch_indices[cluster_idx].push_back(i);
         remaining_len -= actual_len;
         kv_start += actual_len;
         if (zero_kv_len) break;
@@ -1782,6 +1787,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   auto q_start_vec = flatten(cluster_q_start, total_num_works);
   auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
   auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
+  auto batch_indices_vec = flatten(cluster_batch_indices, total_num_works);
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
   plan_info.q_indptr_offset =
@@ -1812,6 +1818,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_kv_end");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "mla_work_indptr");
+  plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "mla_batch_indices");
 
   IdType* cluster_q_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.q_indptr_offset);
@@ -1841,6 +1849,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_end_offset);
   IdType* cluster_work_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.work_indptr_offset);
+  IdType* cluster_batch_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.batch_indices_offset);
 
   std::copy(q_indptr_vec.begin(), q_indptr_vec.end(), cluster_q_indptr_h);
   std::copy(kv_indptr_vec.begin(), kv_indptr_vec.end(), cluster_kv_indptr_h);
@@ -1861,6 +1871,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   std::copy(kv_start_vec.begin(), kv_start_vec.end(), cluster_kv_start_h);
   std::copy(kv_end_vec.begin(), kv_end_vec.end(), cluster_kv_end_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), cluster_work_indptr_h);
+  std::copy(batch_indices_vec.begin(), batch_indices_vec.end(), cluster_batch_indices_h);
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
