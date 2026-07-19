@@ -223,6 +223,12 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
   // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16
   // internally and gates write-back by VALID_HPB.
   if (num_heads <= HPB) {
+    if (num_heads == 4) {
+      launch_prefill_sg<MT, ComputeMode::FP8, 4, 2048, 64>(
+          Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+          topk_length_ptr, stream);
+      return true;
+    }
     if (num_heads == 8) {
       launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64>(
           Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,

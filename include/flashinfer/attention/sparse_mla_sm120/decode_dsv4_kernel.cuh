@@ -747,14 +747,18 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           __floats2bfloat162_rn(acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
       const __nv_bfloat162 pair_hi =
           __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
-      *reinterpret_cast<__nv_bfloat162*>(
-          &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      if (gid < VALID_HPB) {
+        *reinterpret_cast<__nv_bfloat162*>(
+            &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      }
       // gid + 8 slot exists only when the kernel tile holds > 8 heads. For
       // NUM_HEADS=8 (small-TP configs) the second half is invalid and writing
       // would overflow mid_out's head dim.
       if constexpr (VALID_HPB > 8) {
-        *reinterpret_cast<__nv_bfloat162*>(
-            &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+        if (gid + 8 < VALID_HPB) {
+          *reinterpret_cast<__nv_bfloat162*>(
+              &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+        }
       }
     }
   }
@@ -767,11 +771,15 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           __floats2bfloat162_rn(acc_rope[nt][0] * inv_g0, acc_rope[nt][1] * inv_g0);
       const __nv_bfloat162 pair_hi =
           __floats2bfloat162_rn(acc_rope[nt][2] * inv_g1, acc_rope[nt][3] * inv_g1);
-      *reinterpret_cast<__nv_bfloat162*>(
-          &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
-      if constexpr (VALID_HPB > 8) {
+      if (gid < VALID_HPB) {
         *reinterpret_cast<__nv_bfloat162*>(
-            &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+            &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      }
+      if constexpr (VALID_HPB > 8) {
+        if (gid + 8 < VALID_HPB) {
+          *reinterpret_cast<__nv_bfloat162*>(
+              &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+        }
       }
     }
   }

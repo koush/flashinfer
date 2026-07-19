@@ -7,10 +7,10 @@
 // × num_splits). Reuses decode-dsv4's merge kernel for split combine.
 //
 // Supports the full V32-family dispatch grid:
-//   num_heads ∈ {8, 16, 32, 64, 128}
+//   num_heads ∈ {4, 8, 16, 32, 64, 128}
 //   topk      ∈ {128, 512, 1024, 2048}
 //   pbs       = 64
-// = 20 instantiations.
+// = 21 instantiations.
 
 #include <cuda_runtime.h>
 
@@ -147,6 +147,7 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
       DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K) \
     }                                              \
   } while (0);
+  DSV3_2_DISPATCH(4, 2048)
   DSV3_2_DISPATCH(8, 128)
   DSV3_2_DISPATCH(8, 512)
   DSV3_2_DISPATCH(8, 1024)
