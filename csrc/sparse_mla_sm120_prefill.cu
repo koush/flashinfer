@@ -219,10 +219,16 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
   static_assert(KVCacheTraits<MT>::D_QK == 576);
   if (topk != 2048) return false;
 
-  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
-  // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16
-  // internally and gates write-back by VALID_HPB.
+  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=1 covers
+  // large-TP shards (e.g. 64 GPUs); the SG kernel zero-pads invalid head slots
+  // up to HPB=16 internally and gates write-back by VALID_HPB.
   if (num_heads <= HPB) {
+    if (num_heads == 1) {
+      launch_prefill_sg<MT, ComputeMode::FP8, 1, 2048, 64>(
+          Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+          topk_length_ptr, stream);
+      return true;
+    }
     if (num_heads == 4) {
       launch_prefill_sg<MT, ComputeMode::FP8, 4, 2048, 64>(
           Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
