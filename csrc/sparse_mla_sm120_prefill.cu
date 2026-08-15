@@ -67,7 +67,8 @@ void configure_dynamic_smem_per_device(Kernel kernel, size_t smem_bytes,
   CUDA_CHECK(rc);
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool PRUNE_H8 = false>
 void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                        int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
@@ -78,7 +79,7 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
-  auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+  auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, PRUNE_H8>;
   static bool configured[kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
@@ -236,6 +237,12 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
       return true;
     }
     if (num_heads == 8) {
+      if constexpr (MT == ModelType::GLM_NSA) {
+        launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64, true>(
+            Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+            topk_length_ptr, stream);
+        return true;
+      }
       launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64>(
           Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
           topk_length_ptr, stream);

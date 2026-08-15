@@ -75,7 +75,8 @@ struct PrefillColdParams {
       topk_length_extra;  // [num_tokens] int32, dual-cache only. nullptr = uniform topk_extra.
 };
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          bool PRUNE_H8 = false>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
@@ -91,6 +92,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   using CT = ComputeTraits<MT, ComputeMode::FP8>;
   using L = SmemLayout<MT, CM>;
   using IO = KVIOTraits<MT>;
+  static_assert(!PRUNE_H8 || NUM_HEADS == 8);
 
   static constexpr int NI = TOPK / BI;
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
@@ -176,7 +178,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     }
     QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
-    for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) sm.m_smem[h] = -1e30f;
+    constexpr int ACTIVE_HPB = PRUNE_H8 ? 8 : HPB;
+    for (int h = threadIdx.x; h < ACTIVE_HPB; h += MATH_THREADS) sm.m_smem[h] = -1e30f;
 
     float acc_o[CT::ACC_TILES][4];
 #pragma unroll
@@ -319,18 +322,27 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       }
 
       // ── Online softmax (deferred sum, conditional rescale) ──
-      float s[4] = {qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e, qk[2] * sm_scale_log2e,
-                    qk[3] * sm_scale_log2e};
+      float s[4] = {qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e, 0.f, 0.f};
+      if constexpr (!PRUNE_H8) {
+        s[2] = qk[2] * sm_scale_log2e;
+        s[3] = qk[3] * sm_scale_log2e;
+      }
 
-      float lm0, lm1;
-      softmax_warp_max(s, lm0, lm1);
+      float lm0 = fmaxf(s[0], s[1]), lm1 = -1e30f;
+      lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 1));
+      lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 2));
+      if constexpr (!PRUNE_H8) {
+        lm1 = fmaxf(s[2], s[3]);
+        lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff, lm1, 1));
+        lm1 = fmaxf(lm1, __shfl_xor_sync(0xffffffff, lm1, 2));
+      }
       if (tid == 0) {
         sm.reduce_buf[mwarp * HPB + gid] = lm0;
-        sm.reduce_buf[mwarp * HPB + gid + 8] = lm1;
+        if constexpr (!PRUNE_H8) sm.reduce_buf[mwarp * HPB + gid + 8] = lm1;
       }
       bar_sync_t<2, MATH_THREADS>();
 
-      if (threadIdx.x < HPB) {
+      if (threadIdx.x < ACTIVE_HPB) {
         int h = threadIdx.x;
         float old_m = sm.m_smem[h], tm = -1e30f;
 #pragma unroll
@@ -343,16 +355,22 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       }
       bar_sync_t<2, MATH_THREADS>();
 
-      float alpha0 = sm.reduce_buf[gid], alpha1 = sm.reduce_buf[gid + 8];
-      float nm0 = sm.reduce_buf[HPB + gid], nm1 = sm.reduce_buf[HPB + gid + 8];
+      float alpha0 = sm.reduce_buf[gid], alpha1 = 1.f;
+      float nm0 = sm.reduce_buf[HPB + gid], nm1 = -1e30f;
+      if constexpr (!PRUNE_H8) {
+        alpha1 = sm.reduce_buf[gid + 8];
+        nm1 = sm.reduce_buf[HPB + gid + 8];
+      }
 
-      if (alpha0 < 1.0f || alpha1 < 1.0f) {
+      if (alpha0 < 1.0f || (!PRUNE_H8 && alpha1 < 1.0f)) {
 #pragma unroll
         for (int t = 0; t < CT::ACC_TILES; t++) {
           acc_o[t][0] *= alpha0;
           acc_o[t][1] *= alpha0;
-          acc_o[t][2] *= alpha1;
-          acc_o[t][3] *= alpha1;
+          if constexpr (!PRUNE_H8) {
+            acc_o[t][2] *= alpha1;
+            acc_o[t][3] *= alpha1;
+          }
         }
         if constexpr (KV::V_HAS_ROPE) {
           acc_rope[0] *= alpha0;
@@ -361,16 +379,26 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
           acc_rope[3] *= alpha1;
         }
         warp_l[0] *= alpha0;
-        warp_l[1] *= alpha1;
+        if constexpr (!PRUNE_H8) warp_l[1] *= alpha1;
       }
 
       float w0 = exp2f(s[0] - nm0), w1 = exp2f(s[1] - nm0);
-      float w2 = exp2f(s[2] - nm1), w3 = exp2f(s[3] - nm1);
+      float w2 = 0.f, w3 = 0.f;
+      if constexpr (!PRUNE_H8) {
+        w2 = exp2f(s[2] - nm1);
+        w3 = exp2f(s[3] - nm1);
+      }
 
-      float ls0, ls1;
-      softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
+      float ls0 = w0 + w1, ls1 = 0.f;
+      ls0 += __shfl_xor_sync(0xffffffff, ls0, 1);
+      ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
+      if constexpr (!PRUNE_H8) {
+        ls1 = w2 + w3;
+        ls1 += __shfl_xor_sync(0xffffffff, ls1, 1);
+        ls1 += __shfl_xor_sync(0xffffffff, ls1, 2);
+      }
       warp_l[0] += ls0;
-      warp_l[1] += ls1;
+      if constexpr (!PRUNE_H8) warp_l[1] += ls1;
 
       // ── V scale cache + atomicMax ───────────────────────────
       float vsc_cache[CT::N_V_CHUNKS][2];
@@ -390,17 +418,31 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                 ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
           }
           float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
-          float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
+          float ws10 = 0.f, ws11 = 0.f;
+          if constexpr (!PRUNE_H8) {
+            ws10 = w2 * vsc_cache[vc][0];
+            ws11 = w3 * vsc_cache[vc][1];
+          }
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
                     __float_as_int(fmaxf(ws00, ws01)));
-          atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(ws10, ws11)));
+          if constexpr (!PRUNE_H8) {
+            atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
+                      __float_as_int(fmaxf(ws10, ws11)));
+          }
         }
       }
       bar_sync_t<2, MATH_THREADS>();
 
-      for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
-        sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+      if constexpr (PRUNE_H8) {
+        for (int i = threadIdx.x; i < CT::N_V_CHUNKS * 8; i += MATH_THREADS) {
+          int vc = i / 8, h = i % 8;
+          sm.w_head_sc_all[vc * HPB + h] =
+              fmaxf(sm.w_head_sc_all[vc * HPB + h], 1e-10f) / FP8_MAX;
+        }
+      } else {
+        for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
+          sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+      }
       bar_sync_t<2, MATH_THREADS>();
 
       // ── XV nope MMA (D2: direct B from kv_smem) ───────────
@@ -412,16 +454,21 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
           for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
             float* vc_sc = sm.w_head_sc_all + vc * HPB;
             uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
-            float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+            float si0 = 1.f / vc_sc[gid], si1 = 1.f;
+            if constexpr (!PRUNE_H8) si1 = 1.f / vc_sc[gid + 8];
             float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
             float wn00 = w0 * vsc0 * si0, wn01 = w1 * vsc1 * si0;
-            float wn10 = w2 * vsc0 * si1, wn11 = w3 * vsc1 * si1;
+            float wn10 = 0.f, wn11 = 0.f;
+            if constexpr (!PRUNE_H8) {
+              wn10 = w2 * vsc0 * si1;
+              wn11 = w3 * vsc1 * si1;
+            }
             float xv_acc[CT::NT_PER_WARP_XV][4] = {0};
 #pragma unroll
             for (int wpass = 0; wpass < 2; ++wpass) {
               if (wpass > 0) bar_sync_t<2, MATH_THREADS>();
-              Fp8WeightQuad wq =
-                  quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+              Fp8WeightQuad wq = quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(
+                  wn00, wn01, wn10, wn11, wpass);
               wfp8[gid * (BI + 16) + e0i] = wq.h0_e0;
               wfp8[gid * (BI + 16) + e1i] = wq.h0_e1;
               wfp8[(gid + 8) * (BI + 16) + e0i] = wq.h1_e0;
@@ -437,8 +484,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                   uint32_t a0, a1, a2, a3, b0, b1;
                   ldmatrix_load_A_fp8(a0, a1, a2, a3, wfp8 + ko, BI + 16, lane);
                   d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
-                  MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv_acc[nt][0],
-                                                    xv_acc[nt][1], xv_acc[nt][2], xv_acc[nt][3]);
+                  MmaFp8Result r = mma_fp8_m16n8k32(
+                      a0, a1, a2, a3, b0, b1, xv_acc[nt][0], xv_acc[nt][1], xv_acc[nt][2],
+                      xv_acc[nt][3]);
                   xv_acc[nt][0] = r.d0;
                   xv_acc[nt][1] = r.d1;
                   xv_acc[nt][2] = r.d2;
@@ -449,11 +497,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 #pragma unroll
             for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
               int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-              float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
+              float sc0 = vc_sc[gid], sc1 = 0.f;
+              if constexpr (!PRUNE_H8) sc1 = vc_sc[gid + 8];
               acc_o[ti_acc][0] += xv_acc[nt][0] * sc0;
               acc_o[ti_acc][1] += xv_acc[nt][1] * sc0;
-              acc_o[ti_acc][2] += xv_acc[nt][2] * sc1;
-              acc_o[ti_acc][3] += xv_acc[nt][3] * sc1;
+              if constexpr (!PRUNE_H8) {
+                acc_o[ti_acc][2] += xv_acc[nt][2] * sc1;
+                acc_o[ti_acc][3] += xv_acc[nt][3] * sc1;
+              }
             }
           }
         } else {
@@ -529,10 +580,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     // ── Finalize deferred row_sum ────────────────────────────────
     if (tid == 0) {
       sm.reduce_buf[mwarp * HPB + gid] = warp_l[0];
-      sm.reduce_buf[mwarp * HPB + gid + 8] = warp_l[1];
+      if constexpr (!PRUNE_H8) sm.reduce_buf[mwarp * HPB + gid + 8] = warp_l[1];
     }
     bar_sync_t<2, MATH_THREADS>();
-    if (threadIdx.x < HPB) {
+    if (threadIdx.x < ACTIVE_HPB) {
       int h = threadIdx.x;
       float ts = 0.f;
 #pragma unroll
@@ -562,7 +613,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       }
     } else {
       il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
-      il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
+      if constexpr (PRUNE_H8)
+        il1 = 0.f;
+      else
+        il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
     }
 
     bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
@@ -575,8 +629,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       int d0 = c * CT::V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
       staging_bf16[gid * BF16_STAGING_STRIDE + d0] = __float2bfloat16(acc_o[t][0] * il0);
       staging_bf16[gid * BF16_STAGING_STRIDE + d0 + 1] = __float2bfloat16(acc_o[t][1] * il0);
-      staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0] = __float2bfloat16(acc_o[t][2] * il1);
-      staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0 + 1] = __float2bfloat16(acc_o[t][3] * il1);
+      if constexpr (!PRUNE_H8) {
+        staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0] =
+            __float2bfloat16(acc_o[t][2] * il1);
+        staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0 + 1] =
+            __float2bfloat16(acc_o[t][3] * il1);
+      }
     }
 
     if constexpr (KV::V_HAS_ROPE) {
