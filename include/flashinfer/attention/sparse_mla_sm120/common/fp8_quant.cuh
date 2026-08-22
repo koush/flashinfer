@@ -44,9 +44,10 @@
 
 // BF16 Q load: cooperative gmem→smem copy. Counterpart to quantize_q_to_smem
 // for the ComputeMode::BF16 QK path.
-template <ModelType MT, int _MATH_THREADS>
+template <ModelType MT, int _MATH_THREADS, bool SPLIT_Q = false>
 __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_rope,
-                                                    const bf16* q_base, int valid_hpb = HPB) {
+                                                    const bf16* q_base, int valid_hpb = HPB,
+                                                    const bf16* q_rope_base = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
   constexpr int DIM = KV::D_QK;
@@ -55,19 +56,22 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
   for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += _MATH_THREADS) {
     int h = idx / D_NOPE, d = idx % D_NOPE;
     q_nope_bf16[h * BF16_STRIDE + d] =
-        (h < valid_hpb) ? q_base[h * DIM + d] : __float2bfloat16(0.f);
+        (h < valid_hpb) ? q_base[h * (SPLIT_Q ? D_NOPE : DIM) + d] : __float2bfloat16(0.f);
   }
   for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
     int h = i / D_ROPE, d = i % D_ROPE;
-    q_rope[h * D_ROPE + d] = (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+    q_rope[h * D_ROPE + d] = (h < valid_hpb)
+        ? (SPLIT_Q ? q_rope_base[h * D_ROPE + d] : q_base[h * DIM + D_NOPE + d])
+        : __float2bfloat16(0.f);
   }
   bar_sync_t<2, _MATH_THREADS>();
 }
 
-template <ModelType MT, int _MATH_THREADS>
+template <ModelType MT, int _MATH_THREADS, bool SPLIT_Q = false>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
-                                                   bf16* q_rope, const bf16* q_base,
-                                                   float* reduce_buf, int valid_hpb = HPB) {
+                                                    bf16* q_rope, const bf16* q_base,
+                                                    float* reduce_buf, int valid_hpb = HPB,
+                                                    const bf16* q_rope_base = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
   constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;
@@ -80,17 +84,32 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   // Step 1: copy Q rope to smem (only valid heads from gmem; zero-fill rest)
   for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
     int h = i / D_ROPE, d = i % D_ROPE;
-    q_rope[h * D_ROPE + d] = (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+    q_rope[h * D_ROPE + d] = (h < valid_hpb)
+        ? (SPLIT_Q ? q_rope_base[h * D_ROPE + d] : q_base[h * DIM + D_NOPE + d])
+        : __float2bfloat16(0.f);
   }
-  // Step 2: init amax
+  // Step 2: initialize scales, then write each valid tile with a 16-thread subgroup.
   for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += _MATH_THREADS) amax[i] = 0.f;
   bar_sync_t<2, _MATH_THREADS>();
 
-  // Compute absmax per tile (only valid heads)
-  for (int idx = threadIdx.x; idx < valid_hpb * D_NOPE; idx += _MATH_THREADS) {
-    int h = idx / D_NOPE, blk = (idx % D_NOPE) / QUANT_TILE;
-    atomicMax(reinterpret_cast<int*>(&amax[h * NUM_SCALES + blk]),
-              __float_as_int(fabsf(__bfloat162float(q_base[h * DIM + idx % D_NOPE]))));
+  constexpr int REDUCE_THREADS = 16;
+  constexpr int REDUCE_GROUPS = _MATH_THREADS / REDUCE_THREADS;
+  const int reduce_lane = threadIdx.x % REDUCE_THREADS;
+  const int reduce_group = threadIdx.x / REDUCE_THREADS;
+  for (int tile = reduce_group; tile < valid_hpb * NUM_SCALES; tile += REDUCE_GROUPS) {
+    const int h = tile / NUM_SCALES, blk = tile % NUM_SCALES;
+    float local_max = 0.f;
+#pragma unroll
+    for (int d = reduce_lane; d < QUANT_TILE; d += REDUCE_THREADS) {
+      local_max = fmaxf(local_max, fabsf(__bfloat162float(
+          q_base[h * (SPLIT_Q ? D_NOPE : DIM) + blk * QUANT_TILE + d])));
+    }
+#pragma unroll
+    for (int delta = REDUCE_THREADS / 2; delta > 0; delta /= 2) {
+      local_max = fmaxf(local_max,
+                        __shfl_xor_sync(0xffffffff, local_max, delta, REDUCE_THREADS));
+    }
+    if (reduce_lane == 0) amax[tile] = local_max;
   }
   bar_sync_t<2, _MATH_THREADS>();
 
@@ -108,7 +127,8 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
     int h = idx / D_NOPE, d = idx % D_NOPE, blk = d / QUANT_TILE;
     if (h < valid_hpb) {
       float si = 1.f / q_nope_sc[h * NUM_SCALES + blk];
-      float v = fmaxf(FP8_MIN, fminf(FP8_MAX, __bfloat162float(q_base[h * DIM + d]) * si));
+      float v = fmaxf(FP8_MIN, fminf(FP8_MAX,
+          __bfloat162float(q_base[h * (SPLIT_Q ? D_NOPE : DIM) + d]) * si));
       __nv_fp8_e4m3 fp8v(v);
       q_nope_fp8[h * Q_NOPE_STRIDE + d] = fp8v.__x;
     } else {

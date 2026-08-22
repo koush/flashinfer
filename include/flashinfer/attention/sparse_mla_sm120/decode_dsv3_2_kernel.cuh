@@ -118,7 +118,8 @@ struct DecodeDsv3_2Smem {
 // block/SM regardless.
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
-    const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk=576] bf16
+    const bf16* __restrict__ Q,               // contiguous Q or split Q_nope
+    const bf16* __restrict__ Q_rope_split,    // split [num_tokens, num_heads, 64] or null
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (V32 INLINE layout, 656 B/token)
     const int32_t* __restrict__ indices,      // [num_tokens, topk] int32
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
@@ -280,9 +281,17 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const int tid = lane & 3;
 
   // Stage 0: Q quantization.
-  const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base,
-                                              sm.reduce(), VALID_HPB);
+  const int q_stride = Q_rope_split ? D_NOPE : D_QK;
+  const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * q_stride + (size_t)h_start * q_stride;
+  if (Q_rope_split) {
+    const bf16* q_rope_base =
+        Q_rope_split + (size_t)t_idx * NUM_HEADS * D_ROPE_C + (size_t)h_start * D_ROPE_C;
+    quantize_q_to_smem<MT, DSV3_2_MATH_THREADS, true>(
+        sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, sm.reduce(), VALID_HPB, q_rope_base);
+  } else {
+    quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base,
+                                                sm.reduce(), VALID_HPB);
+  }
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};

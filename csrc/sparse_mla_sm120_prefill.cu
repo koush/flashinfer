@@ -72,7 +72,7 @@ template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_
 void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                        int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, const bf16* Q_rope_split = nullptr) {
   constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
   constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
@@ -93,8 +93,8 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          topk_length_ptr,
                          /*topk_length_extra=*/(const int*)nullptr};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
-  void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
-                  (void*)&output, (void*)&out_lse,  (void*)&cold};
+  void* args[] = {(void*)&Q,       (void*)&Q_rope_split, (void*)&KV_cache, (void*)&indices,
+                  (void*)&attn_sink, (void*)&output,     (void*)&out_lse,  (void*)&cold};
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
@@ -216,7 +216,8 @@ template <ModelType MT>
 inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
                          const int32_t* indices, const float* attn_sink, bf16* output,
                          float* out_lse, float sm_scale, int num_tokens, size_t stride_kv_block,
-                         const int* topk_length_ptr, cudaStream_t stream) {
+                          const int* topk_length_ptr, cudaStream_t stream,
+                          const bf16* Q_rope_split = nullptr) {
   static_assert(KVCacheTraits<MT>::D_QK == 576);
   if (topk != 2048) return false;
 
@@ -240,7 +241,7 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
       if constexpr (MT == ModelType::GLM_NSA) {
         launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64, true>(
             Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
-            topk_length_ptr, stream);
+            topk_length_ptr, stream, Q_rope_split);
         return true;
       }
       launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64>(
@@ -420,7 +421,11 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t stride_kv_block_extra,
                                  const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, cudaStream_t stream) {
+                                 const int* extra_topk_length, cudaStream_t stream,
+                                 const bf16* Q_rope_split) {
+  if (Q_rope_split != nullptr && (mt != ModelType::GLM_NSA || extra_KV_cache != nullptr)) {
+    return false;
+  }
   if (extra_KV_cache != nullptr) {
     if (mt != ModelType::DSV4) return false;
     return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
@@ -437,7 +442,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
     case ModelType::GLM_NSA:
       return dispatch_v32<ModelType::GLM_NSA>(num_heads, topk, Q, KV_cache, indices, attn_sink,
                                               output, out_lse, sm_scale, num_tokens,
-                                              stride_kv_block, topk_length, stream);
+                                              stride_kv_block, topk_length, stream, Q_rope_split);
     case ModelType::DSV4:
       return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
                                   sm_scale, num_tokens, stride_kv_block, topk_length, stream);

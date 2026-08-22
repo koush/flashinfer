@@ -78,7 +78,9 @@ struct PrefillColdParams {
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           bool PRUNE_H8 = false>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
-    sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
+    sparse_mla_prefill_kernel(const bf16* __restrict__ Q,
+                              const bf16* __restrict__ Q_rope_split,
+                              const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
                               const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                               bf16* __restrict__ output, float* __restrict__ out_lse,
@@ -167,14 +169,29 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const int mwarp = warp_rank;
     const int gid = lane >> 2, tid = lane & 3;
     const float sm_scale_log2e = sm_scale * LOG2E;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS *
+        (Q_rope_split ? KV::D_NOPE : KV::D_QK) + (size_t)h_start *
+        (Q_rope_split ? KV::D_NOPE : KV::D_QK);
+    const bf16* q_rope_base = Q_rope_split
+        ? Q_rope_split + (size_t)s_i * NUM_HEADS * KV::D_ROPE + (size_t)h_start * KV::D_ROPE
+        : nullptr;
     const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
     if constexpr (CM == ComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      if (q_rope_base) {
+        load_q_bf16_to_smem<MT, MATH_THREADS, true>(sm.q_nope_bf16, sm.q_rope, q_base,
+                                                    VALID_HPB, q_rope_base);
+      } else {
+        load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      }
     } else {
-      quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                           sm.reduce_buf, VALID_HPB);
+      if (q_rope_base) {
+        quantize_q_to_smem<MT, MATH_THREADS, true>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
+                                                   sm.reduce_buf, VALID_HPB, q_rope_base);
+      } else {
+        quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
+                                             sm.reduce_buf, VALID_HPB);
+      }
     }
     QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
@@ -297,8 +314,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       // ── QK rope (BF16 MMA, uses prefetched B operands) ──────
       compute_qk_rope(qk, q_rope_regs, rope_pf);
 
-      // ── Invalid index masking + topk_length overflow ─────
-      {
+      // topk_to_slots guarantees that a full-length row has no invalid slots.
+      if (cold.topk_length == nullptr || topk_len < TOPK) {
         int e0 = qk_nb + tid * 2, e1 = e0 + 1;
         if (ib[e0] < 0) {
           qk[0] = -1e30f;

@@ -52,7 +52,8 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t extra_stride_kv_block,
                                  const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, cudaStream_t stream);
+                                 const int* extra_topk_length, cudaStream_t stream,
+                                 const bf16* Q_rope_split);
 
 namespace {
 
@@ -267,7 +268,7 @@ void SparseMlaSm120PagedAttention(
       mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
       idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
       num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block, attn_sink_ptr, tl_ptr, etl_ptr,
-      stream);
+      stream, nullptr);
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
                      << "model="
                      << (mt == ModelType::DSV3_2 ? "DSV3_2"
