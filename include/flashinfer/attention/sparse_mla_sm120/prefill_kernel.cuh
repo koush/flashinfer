@@ -766,7 +766,8 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           bool DUAL_CACHE, int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T, bool ASSUME_FULL_TILES = false>
 __device__ __forceinline__ void prefill_mg_impl(
-    const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
+    const bf16* __restrict__ Q, const bf16* __restrict__ Q_rope_split,
+    const uint8_t* __restrict__ KV_cache,
     const int32_t* __restrict__ indices,
     const uint8_t* __restrict__ KV_cache_extra,  // nullptr when !DUAL_CACHE
     const int32_t* __restrict__ indices_extra,   // nullptr when !DUAL_CACHE
@@ -954,15 +955,33 @@ __device__ __forceinline__ void prefill_mg_impl(
     // ── Quantize Q for both groups ─────────────────────────────
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++) {
+      const int q_stride = Q_rope_split ? KV::D_NOPE : KV::D_QK;
       const bf16* q_base_g =
-          Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
+          Q + (size_t)s_i * NUM_HEADS * q_stride + (size_t)(h_start + g * HPB) * q_stride;
+      const bf16* q_rope_base_g =
+          Q_rope_split
+              ? Q_rope_split + (size_t)s_i * NUM_HEADS * KV::D_ROPE +
+                    (size_t)(h_start + g * HPB) * KV::D_ROPE
+              : nullptr;
       if constexpr (CM == ComputeMode::BF16) {
-        load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * D_ROPE,
-                                              q_base_g);
+        if (q_rope_base_g) {
+          load_q_bf16_to_smem<MT, MATH_THREADS, true>(
+              sm.q_nope_bf16(g), sm.q_rope() + g * HPB * D_ROPE, q_base_g, HPB,
+              q_rope_base_g);
+        } else {
+          load_q_bf16_to_smem<MT, MATH_THREADS>(
+              sm.q_nope_bf16(g), sm.q_rope() + g * HPB * D_ROPE, q_base_g);
+        }
       } else {
-        quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
-                                             sm.q_rope() + g * HPB * D_ROPE, q_base_g,
-                                             sm.reduce_buf());
+        if (q_rope_base_g) {
+          quantize_q_to_smem<MT, MATH_THREADS, true>(
+              sm.q_nope_fp8(g), sm.q_nope_sc(g), sm.q_rope() + g * HPB * D_ROPE,
+              q_base_g, sm.reduce_buf(), HPB, q_rope_base_g);
+        } else {
+          quantize_q_to_smem<MT, MATH_THREADS>(
+              sm.q_nope_fp8(g), sm.q_nope_sc(g), sm.q_rope() + g * HPB * D_ROPE,
+              q_base_g, sm.reduce_buf());
+        }
       }
     }
 
@@ -1745,15 +1764,17 @@ __device__ __forceinline__ void prefill_mg_impl(
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
-    sparse_mla_prefill_mg_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
+    sparse_mla_prefill_mg_kernel(const bf16* __restrict__ Q,
+                                 const bf16* __restrict__ Q_rope_split,
+                                 const uint8_t* __restrict__ KV_cache,
                                  const int32_t* __restrict__ indices, bf16* __restrict__ output,
                                  float* __restrict__ out_lse,
                                  const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                                  __grid_constant__ const PrefillColdParams cold) {
   prefill_mg_impl<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/false,
                   /*PAGE_BLOCK_SIZE_EXTRA=*/PAGE_BLOCK_SIZE, MG_N_HG_T>(
-      Q, KV_cache, indices, /*KV_cache_extra=*/nullptr, /*indices_extra=*/nullptr, output, out_lse,
-      attn_sink, cold);
+      Q, Q_rope_split, KV_cache, indices, /*KV_cache_extra=*/nullptr,
+      /*indices_extra=*/nullptr, output, out_lse, attn_sink, cold);
 }
 
 // Dual-cache __global__ wrapper. topk_extra is runtime; PAGE_BLOCK_SIZE_EXTRA
@@ -1771,7 +1792,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                       __grid_constant__ const PrefillColdParams cold) {
   prefill_mg_impl<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true,
                   PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>(
-      Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse, attn_sink, cold);
+      Q, /*Q_rope_split=*/nullptr, KV_cache, indices, KV_cache_extra, indices_extra, output,
+      out_lse, attn_sink, cold);
 }
 
 // Dual-cache full-tile wrapper for fixed-length inputs.
@@ -1785,5 +1807,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_dual_f
     __grid_constant__ const PrefillColdParams cold) {
   prefill_mg_impl<MT, ComputeMode::BF16, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true,
                   PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T, /*ASSUME_FULL_TILES=*/true>(
-      Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse, attn_sink, cold);
+      Q, /*Q_rope_split=*/nullptr, KV_cache, indices, KV_cache_extra, indices_extra, output,
+      out_lse, attn_sink, cold);
 }

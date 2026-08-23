@@ -106,7 +106,7 @@ template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_
 void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                        int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, const bf16* Q_rope_split = nullptr) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0,
@@ -128,8 +128,8 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          topk_length_ptr,
                          /*topk_length_extra=*/(const int*)nullptr};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
-  void* args[] = {(void*)&Q,       (void*)&KV_cache,  (void*)&indices, (void*)&output,
-                  (void*)&out_lse, (void*)&attn_sink, (void*)&cold};
+  void* args[] = {(void*)&Q,       (void*)&Q_rope_split, (void*)&KV_cache,  (void*)&indices,
+                  (void*)&output,  (void*)&out_lse,      (void*)&attn_sink, (void*)&cold};
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
@@ -259,8 +259,9 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
 
 #define DISPATCH_DSV3_2_MG(NH)                                                             \
   launch_prefill_mg<MT, ComputeMode::FP8, NH, 2048, 64>(Q, KV, indices, attn_sink, output, \
-                                                        out_lse, sm_scale, num_tokens,     \
-                                                        stride_kv_block, topk_length_ptr, stream)
+                                                         out_lse, sm_scale, num_tokens,     \
+                                                         stride_kv_block, topk_length_ptr, stream, \
+                                                         Q_rope_split)
 
   switch (num_heads) {
     case 32:
