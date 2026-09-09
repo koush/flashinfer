@@ -37,7 +37,8 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const bf16* Q_rope_split,
                                       const int* topk_length, bf16* output, float* out_lse,
                                       const float* attn_sink, int num_tokens, int num_splits,
                                       int chunks_per_block_override, float sm_scale,
-                                      size_t stride_kv_block, cudaStream_t stream) {
+                                      size_t stride_kv_block, cudaStream_t stream,
+                                      const float* Q_scales) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576);
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
@@ -67,7 +68,9 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const bf16* Q_rope_split,
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                      // sm_w_head_sc
       + 2 * HPB * (DSV3_2_BI + 16);                                       // sm_w_fp8 ×2
 
-  auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, TOPK, 64>;
+  auto kernel = Q_scales
+      ? sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, TOPK, 64, true>
+      : sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, TOPK, 64, false>;
   DSV3_2_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
@@ -108,7 +111,7 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const bf16* Q_rope_split,
   dim3 block1(DSV3_2_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(Q, Q_rope_split, KV_cache, indices, mid_out,
                                                      mid_lse, topk_length, num_tokens, num_splits,
-                                                     chunks_per_block, sm_scale, stride_kv_block);
+                                                     chunks_per_block, sm_scale, stride_kv_block, Q_scales);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
@@ -133,14 +136,15 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
                                      bf16* output, float* out_lse, const int* topk_length,
                                      const float* attn_sink, int chunks_per_block_override,
                                      float sm_scale, size_t stride_kv_block, cudaStream_t stream,
-                                     const bf16* Q_rope_split) {
+                                     const bf16* Q_rope_split, const float* Q_scales) {
   if (num_splits <= 0) return false;
+  if (Q_scales && !Q_rope_split) return false;
 #define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                                     \
   if (num_heads == (H) && topk == (K)) {                                                       \
     return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                      \
         Q, Q_rope_split, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
         attn_sink,                                                                            \
-        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
+        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream, Q_scales); \
   }
 #define DSV3_2_DISPATCH(H, K)                      \
   do {                                             \
@@ -175,6 +179,19 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
 #undef DSV3_2_DISPATCH
 #undef DSV3_2_DISPATCH_MT
   return false;
+}
+
+// Preserve the BF16-input raw-pointer API used by framework bindings.
+bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
+                                     int num_splits, const bf16* Q, const uint8_t* KV_cache,
+                                     const int32_t* indices, bf16* mid_out, float* mid_lse,
+                                     bf16* output, float* out_lse, const int* topk_length,
+                                     const float* attn_sink, int chunks_per_block_override,
+                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream,
+                                     const bf16* Q_rope_split) {
+  return launch_sparse_mla_decode_dsv3_2(mt, num_heads, topk, num_tokens, num_splits,
+      Q, KV_cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
+      chunks_per_block_override, sm_scale, stride_kv_block, stream, Q_rope_split, nullptr);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

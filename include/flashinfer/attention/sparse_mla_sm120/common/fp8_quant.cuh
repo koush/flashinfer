@@ -67,6 +67,27 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
   bar_sync_t<2, _MATH_THREADS>();
 }
 
+// Prequantized split Q: contiguous E4M3 rows plus separate FP32 block scales.
+// The caller supplies the same per-128-element power-of-two scales as the
+// online quantizer. Shared-memory row padding is local to this load.
+template <ModelType MT, int MATH_THREADS>
+__device__ __forceinline__ void load_q_fp8_to_smem(
+    uint8_t* q_nope_fp8, float* q_nope_sc, bf16* q_rope,
+    const uint8_t* values, const float* scales, const bf16* rope, int valid_hpb = HPB) {
+  using KV = KVCacheTraits<MT>;
+  for (int i = threadIdx.x; i < HPB * KV::D_NOPE; i += MATH_THREADS) {
+    const int h = i / KV::D_NOPE, d = i % KV::D_NOPE;
+    q_nope_fp8[h * KV::Q_NOPE_STRIDE + d] = h < valid_hpb ? values[i] : 0;
+  }
+  for (int i = threadIdx.x; i < HPB * KV::NUM_SCALES; i += MATH_THREADS) {
+    q_nope_sc[i] = i < valid_hpb * KV::NUM_SCALES ? scales[i] : 1.f;
+  }
+  for (int i = threadIdx.x; i < HPB * KV::D_ROPE; i += MATH_THREADS) {
+    q_rope[i] = i < valid_hpb * KV::D_ROPE ? rope[i] : __float2bfloat16(0.f);
+  }
+  bar_sync_t<2, MATH_THREADS>();
+}
+
 template <ModelType MT, int _MATH_THREADS, bool SPLIT_Q = false>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
                                                     bf16* q_rope, const bf16* q_base,

@@ -73,10 +73,11 @@ struct PrefillColdParams {
   const int* topk_length;  // [num_tokens] int32, nullptr = uniform TOPK.
   const int*
       topk_length_extra;  // [num_tokens] int32, dual-cache only. nullptr = uniform topk_extra.
+  const float* q_scales = nullptr;  // split prequantized Q, [tokens, heads, NUM_SCALES].
 };
 
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
-          bool H8_SPECIALIZED = false>
+          bool H8_SPECIALIZED = false, bool PREQUANTIZED_Q = false>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q,
                               const bf16* __restrict__ Q_rope_split,
@@ -177,7 +178,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
         : nullptr;
     const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-    if constexpr (CM == ComputeMode::BF16) {
+    if constexpr (PREQUANTIZED_Q) {
+      static_assert(CM == ComputeMode::FP8);
+      const size_t head = (size_t)s_i * NUM_HEADS + h_start;
+      load_q_fp8_to_smem<MT, MATH_THREADS>(
+          sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope,
+          reinterpret_cast<const uint8_t*>(Q) + head * KV::D_NOPE,
+          cold.q_scales + head * KV::NUM_SCALES, q_rope_base, VALID_HPB);
+    } else if constexpr (CM == ComputeMode::BF16) {
       if (q_rope_base) {
         load_q_bf16_to_smem<MT, MATH_THREADS, true>(sm.q_nope_bf16, sm.q_rope, q_base,
                                                     VALID_HPB, q_rope_base);
@@ -764,7 +772,8 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
 
 // Shared MG implementation for single-cache and dual-cache prefill.
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
-          bool DUAL_CACHE, int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T, bool ASSUME_FULL_TILES = false>
+          bool DUAL_CACHE, int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T, bool ASSUME_FULL_TILES = false,
+          bool PREQUANTIZED_Q = false>
 __device__ __forceinline__ void prefill_mg_impl(
     const bf16* __restrict__ Q, const bf16* __restrict__ Q_rope_split,
     const uint8_t* __restrict__ KV_cache,
@@ -963,7 +972,14 @@ __device__ __forceinline__ void prefill_mg_impl(
               ? Q_rope_split + (size_t)s_i * NUM_HEADS * KV::D_ROPE +
                     (size_t)(h_start + g * HPB) * KV::D_ROPE
               : nullptr;
-      if constexpr (CM == ComputeMode::BF16) {
+      if constexpr (PREQUANTIZED_Q) {
+        static_assert(CM == ComputeMode::FP8 && !DUAL_CACHE);
+        const size_t head = (size_t)s_i * NUM_HEADS + h_start + g * HPB;
+        load_q_fp8_to_smem<MT, MATH_THREADS>(
+            sm.q_nope_fp8(g), sm.q_nope_sc(g), sm.q_rope() + g * HPB * D_ROPE,
+            reinterpret_cast<const uint8_t*>(Q) + head * KV::D_NOPE,
+            cold.q_scales + head * KV::NUM_SCALES, q_rope_base_g);
+      } else if constexpr (CM == ComputeMode::BF16) {
         if (q_rope_base_g) {
           load_q_bf16_to_smem<MT, MATH_THREADS, true>(
               sm.q_nope_bf16(g), sm.q_rope() + g * HPB * D_ROPE, q_base_g, HPB,
@@ -1762,7 +1778,7 @@ __device__ __forceinline__ void prefill_mg_impl(
 
 // Single-cache __global__ wrapper.
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
-          int MG_N_HG_T = MG_N_HG_DEFAULT>
+          int MG_N_HG_T = MG_N_HG_DEFAULT, bool PREQUANTIZED_Q = false>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_prefill_mg_kernel(const bf16* __restrict__ Q,
                                  const bf16* __restrict__ Q_rope_split,
@@ -1772,7 +1788,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                  const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                                  __grid_constant__ const PrefillColdParams cold) {
   prefill_mg_impl<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/false,
-                  /*PAGE_BLOCK_SIZE_EXTRA=*/PAGE_BLOCK_SIZE, MG_N_HG_T>(
+                  /*PAGE_BLOCK_SIZE_EXTRA=*/PAGE_BLOCK_SIZE, MG_N_HG_T, false, PREQUANTIZED_Q>(
       Q, Q_rope_split, KV_cache, indices, /*KV_cache_extra=*/nullptr,
       /*indices_extra=*/nullptr, output, out_lse, attn_sink, cold);
 }

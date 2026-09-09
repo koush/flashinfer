@@ -116,7 +116,7 @@ struct DecodeDsv3_2Smem {
 
 // No minBlocksPerSM hint on launch_bounds: kernel is smem-bound at 1
 // block/SM regardless.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, bool PREQUANTIZED_Q = false>
 __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
     const bf16* __restrict__ Q,               // contiguous Q or split Q_nope
     const bf16* __restrict__ Q_rope_split,    // split [num_tokens, num_heads, 64] or null
@@ -125,7 +125,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block) {
+    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block,
+    const float* __restrict__ Q_scales = nullptr) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576);
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
@@ -283,7 +284,13 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // Stage 0: Q quantization.
   const int q_stride = Q_rope_split ? D_NOPE : D_QK;
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * q_stride + (size_t)h_start * q_stride;
-  if (Q_rope_split) {
+  if constexpr (PREQUANTIZED_Q) {
+    const size_t head = (size_t)t_idx * NUM_HEADS + h_start;
+    load_q_fp8_to_smem<MT, DSV3_2_MATH_THREADS>(
+        sm.q_fp8(), sm.q_sc(), sm.q_rope(),
+        reinterpret_cast<const uint8_t*>(Q) + head * D_NOPE,
+        Q_scales + head * NUM_SCALES, Q_rope_split + head * D_ROPE_C, VALID_HPB);
+  } else if (Q_rope_split) {
     const bf16* q_rope_base =
         Q_rope_split + (size_t)t_idx * NUM_HEADS * D_ROPE_C + (size_t)h_start * D_ROPE_C;
     quantize_q_to_smem<MT, DSV3_2_MATH_THREADS, true>(
@@ -665,7 +672,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
     const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
-    mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
+    if (gid < VALID_HPB) {
+      mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
+    }
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
     }
