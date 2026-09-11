@@ -65,6 +65,8 @@ struct PrefillColdParams {
   const int* topk_length;  // [num_tokens] int32, nullptr = uniform topk.
   const int*
       topk_length_extra;  // [num_tokens] int32, dual-cache only. nullptr = uniform topk_extra.
+  const bf16* q_rope_split = nullptr;
+  const float* q_scales = nullptr;
 };
 
 // ============================================================================

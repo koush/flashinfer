@@ -111,12 +111,17 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   if (mwarp < QK_WARPS) {
     // ── Producer: QK + softmax + W quant ─────────────────────────
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const size_t q_head = (size_t)s_i * NUM_HEADS + h_start;
+    const bf16* q_base = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
+    const bf16* q_rope_base = cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
+    const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
 
     if constexpr (CM == ComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+                                          q_rope_base);
     } else {
-      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB);
+      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB,
+                                         q_rope_base, q_scales);
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -632,7 +637,10 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     const bool qk_warp = !Cfg::SPLIT_QK_XV || mwarp < Cfg::QK_WARPS;
     const int gid = lane >> 2, tid = lane & 3;
     const float sm_scale_log2e = sm_scale * LOG2E;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const size_t q_head = (size_t)s_i * NUM_HEADS + h_start;
+    const bf16* q_base = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
+    const bf16* q_rope_base = cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
+    const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
     const int32_t* idx_base = indices + (size_t)s_i * topk;
 
     // Candidate slice of this warp. Meaningful only for a QK warp: past
@@ -641,10 +649,11 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
 
     if constexpr (CM == ComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+                                                 q_rope_base);
     } else {
       quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                                VALID_HPB);
+                                                VALID_HPB, q_rope_base, q_scales);
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -1331,15 +1340,18 @@ __device__ __forceinline__ void prefill_mg_impl(
     // ── Quantize Q for both groups ─────────────────────────────
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++) {
-      const bf16* q_base_g =
-          Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
+      const size_t q_head = (size_t)s_i * NUM_HEADS + h_start + g * HPB;
+      const bf16* q_base_g = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
+      const bf16* q_rope_base =
+          cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
+      const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
       if constexpr (CM == ComputeMode::BF16) {
         load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * KV::D_ROPE,
-                                              q_base_g, VALID_HPB);
+                                              q_base_g, VALID_HPB, q_rope_base);
       } else {
         quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
                                              sm.q_rope() + g * HPB * KV::D_ROPE, q_base_g,
-                                             VALID_HPB);
+                                             VALID_HPB, q_rope_base, q_scales);
       }
     }
 

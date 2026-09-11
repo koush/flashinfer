@@ -134,12 +134,11 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     // Per-token advance in the KV cache. Equals KV::KV_GMEM_STRIDE for a packed
     // cache, but is larger when the caller pads rows to share one KV cache
     // group across layer geometries; the payload stays at the row start.
-    int stride_kv_row) {
+    int stride_kv_row, const bf16* Q_rope_split = nullptr, const float* Q_scales = nullptr) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
-  constexpr int D_QK = KV::D_QK;                                    // 576
   constexpr int D_V_C = KV::D_V;                                    // 512
   constexpr int QUANT_TILE = KV::QUANT_TILE;                        // 128
   constexpr int NUM_SCALES = KV::NUM_SCALES;                        // 4
@@ -306,8 +305,12 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const int tid = lane & 3;
 
   // Stage 0: Q quantization (rows past valid_h are zero-filled).
-  const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
+  const size_t q_head = (size_t)t_idx * q_heads + h_start;
+  const bf16* q_base = query_head_ptr<MT>(Q, q_head, Q_rope_split, Q_scales);
+  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(
+      sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h,
+      Q_rope_split ? Q_rope_split + q_head * D_ROPE_C : nullptr,
+      Q_scales ? Q_scales + q_head * NUM_SCALES : nullptr);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};

@@ -81,7 +81,8 @@ template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE>
 void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                        int num_tokens, int topk, size_t stride_kv_block, size_t stride_out_lse,
-                       const int* topk_length_ptr, cudaStream_t stream) {
+                       const int* topk_length_ptr, cudaStream_t stream,
+                       const bf16* Q_rope_split = nullptr, const float* Q_scales = nullptr) {
   using Cfg = PrefillTileCfg<MT>;
   constexpr size_t smem_bytes = SmemLayout<MT, CM, Cfg::BI, Cfg::MATH_WARPS>::TOTAL;
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
@@ -103,7 +104,9 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          /*topk_extra=*/0,
                          attn_sink,
                          topk_length_ptr,
-                         /*topk_length_extra=*/(const int*)nullptr};
+                         /*topk_length_extra=*/(const int*)nullptr,
+                         Q_rope_split,
+                         Q_scales};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
                   (void*)&output, (void*)&out_lse,  (void*)&cold};
@@ -115,7 +118,8 @@ template <ModelType MT, int NUM_HEADS>
 void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                            const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                            int num_tokens, int topk, size_t stride_kv_block, size_t stride_out_lse,
-                           const int* topk_length_ptr, cudaStream_t stream) {
+                           const int* topk_length_ptr, cudaStream_t stream,
+                           const bf16* Q_rope_split, const float* Q_scales) {
   using CT = ComputeTraitsSwapAB<MT>;
   using L = SmemLayoutSwapAB<MT>;
   static_assert(KVCacheTraits<MT>::SCALE_IN_KV_SMEM && KVCacheTraits<MT>::D_NOPE == D_V,
@@ -138,7 +142,9 @@ void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t
                          /*topk_extra=*/0,
                          attn_sink,
                          topk_length_ptr,
-                         /*topk_length_extra=*/(const int*)nullptr};
+                         /*topk_length_extra=*/(const int*)nullptr,
+                         Q_rope_split,
+                         Q_scales};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
                   (void*)&output, (void*)&out_lse,  (void*)&cold};
@@ -152,7 +158,8 @@ template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE,
 void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                        int num_tokens, int topk, size_t stride_kv_block, size_t stride_out_lse,
-                       const int* topk_length_ptr, cudaStream_t stream) {
+                       const int* topk_length_ptr, cudaStream_t stream,
+                       const bf16* Q_rope_split = nullptr, const float* Q_scales = nullptr) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
@@ -174,7 +181,9 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                          /*topk_extra=*/0,
                          attn_sink,
                          topk_length_ptr,
-                         /*topk_length_extra=*/(const int*)nullptr};
+                         /*topk_length_extra=*/(const int*)nullptr,
+                         Q_rope_split,
+                         Q_scales};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,       (void*)&KV_cache,  (void*)&indices, (void*)&output,
                   (void*)&out_lse, (void*)&attn_sink, (void*)&cold};
@@ -275,11 +284,13 @@ inline bool dispatch_v32_swapab(int num_heads, int topk, int page_block_size, co
                                 const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                 bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                 size_t stride_kv_block, size_t stride_out_lse,
-                                const int* topk_length_ptr, cudaStream_t stream) {
+                                const int* topk_length_ptr, cudaStream_t stream,
+                                const bf16* Q_rope_split, const float* Q_scales) {
   if (page_block_size != 64) return false;
 #define DISPATCH_DSV3_2_SWAPAB(NH)                                                                \
   launch_prefill_swapab<MT, NH>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, \
-                                topk, stride_kv_block, stride_out_lse, topk_length_ptr, stream)
+                                topk, stride_kv_block, stride_out_lse, topk_length_ptr, stream,   \
+                                Q_rope_split, Q_scales)
 
   switch (num_heads) {
     case 64:
@@ -303,18 +314,19 @@ inline bool dispatch_v32_sg(int num_heads, int topk, int page_block_size, const 
                             const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                             bf16* output, float* out_lse, float sm_scale, int num_tokens,
                             size_t stride_kv_block, size_t stride_out_lse,
-                            const int* topk_length_ptr, cudaStream_t stream) {
+                            const int* topk_length_ptr, cudaStream_t stream,
+                            const bf16* Q_rope_split, const float* Q_scales) {
   if (page_block_size != 64) return false;
   if (num_heads == 8) {
-    launch_prefill_sg<MT, ComputeMode::FP8, 8, 64>(Q, KV, indices, attn_sink, output, out_lse,
-                                                   sm_scale, num_tokens, topk, stride_kv_block,
-                                                   stride_out_lse, topk_length_ptr, stream);
+    launch_prefill_sg<MT, ComputeMode::FP8, 8, 64>(
+        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block,
+        stride_out_lse, topk_length_ptr, stream, Q_rope_split, Q_scales);
     return true;
   }
   if (num_heads != 16) return false;
-  launch_prefill_sg<MT, ComputeMode::FP8, 16, 64>(Q, KV, indices, attn_sink, output, out_lse,
-                                                  sm_scale, num_tokens, topk, stride_kv_block,
-                                                  stride_out_lse, topk_length_ptr, stream);
+  launch_prefill_sg<MT, ComputeMode::FP8, 16, 64>(
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block,
+      stride_out_lse, topk_length_ptr, stream, Q_rope_split, Q_scales);
   return true;
 }
 
@@ -324,13 +336,14 @@ inline bool dispatch_v32_mg(int num_heads, int topk, int page_block_size, const 
                             const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                             bf16* output, float* out_lse, float sm_scale, int num_tokens,
                             size_t stride_kv_block, size_t stride_out_lse,
-                            const int* topk_length_ptr, cudaStream_t stream) {
+                            const int* topk_length_ptr, cudaStream_t stream,
+                            const bf16* Q_rope_split, const float* Q_scales) {
   if (page_block_size != 64) return false;
 
 #define DISPATCH_DSV3_2_MG(NH)                                                                 \
-  launch_prefill_mg<MT, ComputeMode::FP8, NH, 64>(Q, KV, indices, attn_sink, output, out_lse,  \
-                                                  sm_scale, num_tokens, topk, stride_kv_block, \
-                                                  stride_out_lse, topk_length_ptr, stream)
+  launch_prefill_mg<MT, ComputeMode::FP8, NH, 64>(                                             \
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block, \
+      stride_out_lse, topk_length_ptr, stream, Q_rope_split, Q_scales)
 
   switch (num_heads) {
     case 32:
@@ -541,7 +554,10 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
                                  size_t stride_kv_block, size_t stride_kv_block_extra,
                                  size_t stride_out_lse, const float* attn_sink,
                                  const int* topk_length, const int* extra_topk_length,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, const bf16* Q_rope_split,
+                                 const float* Q_scales) {
+  if ((Q_rope_split || Q_scales) && (mt != ModelType::GLM_NSA || extra_KV_cache)) return false;
+  if (Q_scales && !Q_rope_split) return false;
   // V32-family variants (swapAB/SG/MG) dispatch over the three V32 model
   // types; topk is runtime, so each serves the whole family at any width.
 #define DISPATCH_V32(fn)                                                                         \
@@ -550,15 +566,18 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
       case ModelType::DSV3_2:                                                                    \
         return fn<ModelType::DSV3_2>(num_heads, topk, page_block_size, Q, KV_cache, indices,     \
                                      attn_sink, output, out_lse, sm_scale, num_tokens,           \
-                                     stride_kv_block, stride_out_lse, topk_length, stream);      \
+                                     stride_kv_block, stride_out_lse, topk_length, stream,       \
+                                     Q_rope_split, Q_scales);                                    \
       case ModelType::GLM_NSA:                                                                   \
         return fn<ModelType::GLM_NSA>(num_heads, topk, page_block_size, Q, KV_cache, indices,    \
                                       attn_sink, output, out_lse, sm_scale, num_tokens,          \
-                                      stride_kv_block, stride_out_lse, topk_length, stream);     \
+                                      stride_kv_block, stride_out_lse, topk_length, stream,      \
+                                      Q_rope_split, Q_scales);                                   \
       case ModelType::GLM53_NOPE:                                                                \
         return fn<ModelType::GLM53_NOPE>(num_heads, topk, page_block_size, Q, KV_cache, indices, \
                                          attn_sink, output, out_lse, sm_scale, num_tokens,       \
-                                         stride_kv_block, stride_out_lse, topk_length, stream);  \
+                                         stride_kv_block, stride_out_lse, topk_length, stream,   \
+                                         Q_rope_split, Q_scales);                                \
       default:                                                                                   \
         return false;                                                                            \
     }                                                                                            \
@@ -598,6 +617,23 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
   }
   return false;
 #undef DISPATCH_V32
+}
+
+// Preserve the packed-BF16 entry point used by upstream's Python binding.
+bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_heads, int topk,
+                                 int page_block_size, int topk_extra, int extra_page_block_size,
+                                 const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                                 const uint8_t* extra_KV_cache, const int32_t* extra_indices,
+                                 bf16* output, float* out_lse, float sm_scale, int num_tokens,
+                                 size_t stride_kv_block, size_t stride_kv_block_extra,
+                                 size_t stride_out_lse, const float* attn_sink,
+                                 const int* topk_length, const int* extra_topk_length,
+                                 cudaStream_t stream) {
+  return sparse_mla_prefill_dispatch(
+      mt, variant, num_heads, topk, page_block_size, topk_extra, extra_page_block_size, Q, KV_cache,
+      indices, extra_KV_cache, extra_indices, output, out_lse, sm_scale, num_tokens,
+      stride_kv_block, stride_kv_block_extra, stride_out_lse, attn_sink, topk_length,
+      extra_topk_length, stream, nullptr, nullptr);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

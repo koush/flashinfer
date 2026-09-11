@@ -31,14 +31,12 @@ namespace flashinfer::sparse_mla_sm120 {
   } while (0)
 
 template <ModelType MT, int NUM_HEADS>
-static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
-                                      const uint8_t* KV_cache, const int32_t* indices,
-                                      bf16* mid_out, float* mid_lse, const int* topk_length,
-                                      bf16* output, float* out_lse, const float* attn_sink,
-                                      int num_tokens, int num_splits, int chunks_per_block_override,
-                                      float sm_scale, size_t stride_kv_block,
-                                      size_t stride_indices_token, int stride_kv_row,
-                                      size_t stride_out_lse, cudaStream_t stream) {
+static bool launch_decode_dsv3_2_impl(
+    int num_heads, int topk, const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+    bf16* mid_out, float* mid_lse, const int* topk_length, bf16* output, float* out_lse,
+    const float* attn_sink, int num_tokens, int num_splits, int chunks_per_block_override,
+    float sm_scale, size_t stride_kv_block, size_t stride_indices_token, int stride_kv_row,
+    size_t stride_out_lse, cudaStream_t stream, const bf16* Q_rope_split, const float* Q_scales) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)
@@ -117,7 +115,8 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
   dim3 block1(DSV3_2_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
-      chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row);
+      chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row,
+      Q_rope_split, Q_scales);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
@@ -142,14 +141,13 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
 // shapes); every other num_heads <= 128 falls back to one runtime-H
 // instantiation.
 // Returns false if (num_heads, topk) is outside the dispatch envelope.
-bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
-                                     int num_splits, const bf16* Q, const uint8_t* KV_cache,
-                                     const int32_t* indices, bf16* mid_out, float* mid_lse,
-                                     bf16* output, float* out_lse, const int* topk_length,
-                                     const float* attn_sink, int chunks_per_block_override,
-                                     float sm_scale, size_t stride_kv_block,
-                                     size_t stride_indices_token, int stride_kv_row,
-                                     size_t stride_out_lse, cudaStream_t stream) {
+bool launch_sparse_mla_decode_dsv3_2(
+    ModelType mt, int num_heads, int topk, int num_tokens, int num_splits, const bf16* Q,
+    const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out, float* mid_lse, bf16* output,
+    float* out_lse, const int* topk_length, const float* attn_sink, int chunks_per_block_override,
+    float sm_scale, size_t stride_kv_block, size_t stride_indices_token, int stride_kv_row,
+    size_t stride_out_lse, cudaStream_t stream, const bf16* Q_rope_split, const float* Q_scales) {
+  if (Q_scales && (mt != ModelType::GLM_NSA || !Q_rope_split)) return false;
   if (num_splits <= 0) return false;
   if (num_heads < 1 || num_heads > 128) return false;
   if (topk < 1) return false;
@@ -158,14 +156,14 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
     return launch_decode_dsv3_2_impl<MT_VALUE, (H)>(                                             \
         num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
         attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
-        stride_indices_token, stride_kv_row, stride_out_lse, stream);                            \
+        stride_indices_token, stride_kv_row, stride_out_lse, stream, Q_rope_split, Q_scales);    \
   }
 #define DSV3_2_DISPATCH_RT_MT(MT_VALUE)                                                          \
   {                                                                                              \
     return launch_decode_dsv3_2_impl<MT_VALUE, 0>(                                               \
         num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
         attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
-        stride_indices_token, stride_kv_row, stride_out_lse, stream);                            \
+        stride_indices_token, stride_kv_row, stride_out_lse, stream, Q_rope_split, Q_scales);    \
   }
 #define DSV3_2_DISPATCH(H)                      \
   do {                                          \
@@ -197,6 +195,21 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
 #undef DSV3_2_DISPATCH_RT_MT
 #undef DSV3_2_DISPATCH_MT
   return false;
+}
+
+// Preserve the packed-BF16 entry point used by upstream's Python binding.
+bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
+                                     int num_splits, const bf16* Q, const uint8_t* KV_cache,
+                                     const int32_t* indices, bf16* mid_out, float* mid_lse,
+                                     bf16* output, float* out_lse, const int* topk_length,
+                                     const float* attn_sink, int chunks_per_block_override,
+                                     float sm_scale, size_t stride_kv_block,
+                                     size_t stride_indices_token, int stride_kv_row,
+                                     size_t stride_out_lse, cudaStream_t stream) {
+  return launch_sparse_mla_decode_dsv3_2(
+      mt, num_heads, topk, num_tokens, num_splits, Q, KV_cache, indices, mid_out, mid_lse, output,
+      out_lse, topk_length, attn_sink, chunks_per_block_override, sm_scale, stride_kv_block,
+      stride_indices_token, stride_kv_row, stride_out_lse, stream, nullptr, nullptr);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

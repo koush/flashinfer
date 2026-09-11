@@ -49,11 +49,23 @@
 //
 // Template on ModelType to get correct Q_NOPE_STRIDE and NUM_SCALES.
 
+// Split inputs have dense D_NOPE rows; prequantized rows contain one byte per
+// element. Keep this address calculation shared by all prefill/decode variants.
+template <ModelType MT>
+__device__ __forceinline__ const bf16* query_head_ptr(const bf16* q, size_t head, const bf16* rope,
+                                                      const float* scales) {
+  using KV = KVCacheTraits<MT>;
+  if (scales)
+    return reinterpret_cast<const bf16*>(reinterpret_cast<const uint8_t*>(q) + head * KV::D_NOPE);
+  return q + head * (rope ? KV::D_NOPE : KV::D_QK);
+}
+
 // BF16 Q load: cooperative gmem→smem copy. Counterpart to quantize_q_to_smem
 // for the ComputeMode::BF16 QK path.
 template <ModelType MT, int _MATH_THREADS>
 __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_rope,
-                                                    const bf16* q_base, int valid_hpb = HPB) {
+                                                    const bf16* q_base, int valid_hpb = HPB,
+                                                    const bf16* rope_base = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
   constexpr int D_ROPE = KV::D_ROPE;
@@ -63,13 +75,14 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
   for (int idx = threadIdx.x; idx < HPB * D_NOPE; idx += _MATH_THREADS) {
     int h = idx / D_NOPE, d = idx % D_NOPE;
     q_nope_bf16[h * BF16_STRIDE + d] =
-        (h < valid_hpb) ? q_base[h * DIM + d] : __float2bfloat16(0.f);
+        (h < valid_hpb) ? q_base[h * (rope_base ? D_NOPE : DIM) + d] : __float2bfloat16(0.f);
   }
   if constexpr (D_ROPE > 0) {
     for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
       int h = i / D_ROPE, d = i % D_ROPE;
       q_rope[h * D_ROPE + d] =
-          (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+          (h < valid_hpb) ? (rope_base ? rope_base[h * D_ROPE + d] : q_base[h * DIM + D_NOPE + d])
+                          : __float2bfloat16(0.f);
     }
   }
   bar_sync_t<2, _MATH_THREADS>();
@@ -85,12 +98,25 @@ struct QSwapABRegs {
 };
 
 template <ModelType MT>
-__device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(const bf16* q_base, int lane) {
+__device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(
+    const bf16* q_base, int lane, const float* scales = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int NOPE_KSTEPS = KV::D_NOPE / 32;
   constexpr int STEPS_PER_GRP = KV::QUANT_TILE / 32;
   const int tid = lane & 3;
   QSwapABRegs<MT> q;
+
+  if (scales) {
+#pragma unroll
+    for (int g = 0; g < KV::NUM_SCALES; g++) q.scale[g] = scales[g];
+#pragma unroll
+    for (int ik = 0; ik < NOPE_KSTEPS; ik++) {
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(q_base) + ik * 32 + tid * 4;
+      q.nope[ik][0] = *reinterpret_cast<const uint32_t*>(p);
+      q.nope[ik][1] = *reinterpret_cast<const uint32_t*>(p + 16);
+    }
+    return q;
+  }
 
 #pragma unroll
   for (int g = 0; g < KV::NUM_SCALES; g++) q.scale[g] = 0.f;
@@ -146,7 +172,9 @@ __device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(const bf16*
 template <ModelType MT, int _MATH_THREADS>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
                                                    bf16* q_rope, const bf16* q_base,
-                                                   int valid_hpb = HPB) {
+                                                   int valid_hpb = HPB,
+                                                   const bf16* rope_base = nullptr,
+                                                   const float* scales = nullptr) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
   constexpr int D_ROPE = KV::D_ROPE;
@@ -164,9 +192,26 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
     for (int v = tid; v < HPB * ROPE_VECS_PER_HEAD; v += _MATH_THREADS) {
       const int h = v / ROPE_VECS_PER_HEAD, r = v % ROPE_VECS_PER_HEAD;
       uint4 val = make_uint4(0, 0, 0, 0);
-      if (h < valid_hpb) val = *reinterpret_cast<const uint4*>(q_base + h * DIM + D_NOPE + r * 8);
+      if (h < valid_hpb)
+        val = *reinterpret_cast<const uint4*>(rope_base ? rope_base + h * D_ROPE + r * 8
+                                                        : q_base + h * DIM + D_NOPE + r * 8);
       *reinterpret_cast<uint4*>(q_rope + h * D_ROPE + r * 8) = val;
     }
+  }
+
+  // Prequantized split Q uses FP8 values and separate per-tile FP32 scales.
+  if (scales) {
+    const uint8_t* values = reinterpret_cast<const uint8_t*>(q_base);
+    for (int i = tid; i < HPB * D_NOPE / 16; i += _MATH_THREADS) {
+      const int h = i / (D_NOPE / 16), d = (i % (D_NOPE / 16)) * 16;
+      *reinterpret_cast<uint4*>(q_nope_fp8 + h * Q_NOPE_STRIDE + d) =
+          h < valid_hpb ? *reinterpret_cast<const uint4*>(values + h * D_NOPE + d)
+                        : make_uint4(0, 0, 0, 0);
+    }
+    for (int i = tid; i < HPB * NUM_SCALES; i += _MATH_THREADS)
+      q_nope_sc[i] = i < valid_hpb * NUM_SCALES ? scales[i] : 1.f;
+    bar_sync_t<2, _MATH_THREADS>();
+    return;
   }
 
   // Steps 2-4, fused into a single gmem pass over Q nope.
@@ -196,7 +241,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
     const bool load = in_range && h < valid_hpb;
 
     uint4 pk = make_uint4(0, 0, 0, 0);
-    if (load) pk = *reinterpret_cast<const uint4*>(q_base + h * DIM + d0);
+    if (load) pk = *reinterpret_cast<const uint4*>(q_base + h * (rope_base ? D_NOPE : DIM) + d0);
     const bf16* e = reinterpret_cast<const bf16*>(&pk);
 
     // Per-thread absmax over this thread's 8 elements, then across the tile's

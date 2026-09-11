@@ -164,10 +164,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     // B fragment column n == gid, so this lane feeds head h_base + gid; the C
     // fragment hands back heads h_base + 2*tid and h_base + 2*tid + 1.
     const int h_base = h_start + mwarp * HPW;
-    const bf16* q_base = Q + ((size_t)s_i * NUM_HEADS + h_base + gid) * KV::D_QK;
+    const size_t q_head = (size_t)s_i * NUM_HEADS + h_base + gid;
+    const bf16* q_base = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
 
-    QSwapABRegs<MT> q = quantize_q_to_regs_swapab<MT>(q_base, lane);
-    KVRopePrefetch<MT> q_rope = prefetch_kv_rope<MT>(q_base + KV::D_NOPE, lane);
+    QSwapABRegs<MT> q = quantize_q_to_regs_swapab<MT>(
+        q_base, lane, cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr);
+    KVRopePrefetch<MT> q_rope = prefetch_kv_rope<MT>(
+        cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : q_base + KV::D_NOPE, lane);
 
     uint8_t sfb[KV::NUM_SCALES];
     float q_sc[2][KV::NUM_SCALES];
