@@ -12,6 +12,7 @@ from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union
 import torch
 
 from ....jit import gen_batch_mla_module
+from ....quantization import segment_packbits
 from ....utils import MaskMode, check_shape_dtype_device, get_compute_capability
 from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
 from .._planning import _MLAPlanArguments
@@ -342,6 +343,8 @@ class _BatchMLAGeneratedFaMechanics:
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
         self._plan_info = plan_info
+        self._mask_qo_indptr_host = qo_indptr_host
+        self._mask_kv_len_host = kv_len_arr_host
         self._staged_int_workspace_bytes = staged_int_workspace_bytes
 
     def _validate_run_input_dtypes(
@@ -388,6 +391,10 @@ class _BatchMLAGeneratedFaMechanics:
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # ---------------------------------------------------------------------------
         # Validate inputs and scale arguments
@@ -468,6 +475,15 @@ class _BatchMLAGeneratedFaMechanics:
         # Launch the generated backend
         # ---------------------------------------------------------------------------
         mask_mode = MaskMode.CAUSAL.value if self._causal else MaskMode.NON_CAUSAL.value
+        mask_args = ()
+        if self._backend == "fa2":
+            mask_mode, mask_args = self._prepare_custom_mask(
+                mask_mode,
+                custom_mask,
+                packed_custom_mask,
+                causal_custom_mask,
+                causal_custom_mask_kv_len,
+            )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
         self._cached_module.run(
             self._float_workspace_buffer,
@@ -488,9 +504,75 @@ class _BatchMLAGeneratedFaMechanics:
             ckv_scale_f,
             kpe_scale_f,
             ckv_scale_arr,
+            *mask_args,
             *profiler_args,
         )
         return (out, lse) if return_lse else out
+
+    def _prepare_custom_mask(
+        self,
+        mask_mode,
+        custom_mask,
+        packed_custom_mask,
+        causal_custom_mask,
+        causal_custom_mask_kv_len,
+    ):
+        if (
+            sum(
+                x is not None
+                for x in (custom_mask, packed_custom_mask, causal_custom_mask)
+            )
+            > 1
+        ):
+            raise ValueError("Only one custom MLA mask may be specified.")
+        if causal_custom_mask_kv_len is not None and causal_custom_mask is None:
+            raise ValueError("causal_custom_mask_kv_len requires causal_custom_mask.")
+        if all(
+            x is None for x in (custom_mask, packed_custom_mask, causal_custom_mask)
+        ):
+            return mask_mode, (None, None, None)
+        qo_lens = self._mask_qo_indptr_host[1:] - self._mask_qo_indptr_host[:-1]
+        suffix = causal_custom_mask is not None
+        widths = (
+            (
+                qo_lens
+                if causal_custom_mask_kv_len is None
+                else causal_custom_mask_kv_len.cpu()
+            )
+            if suffix
+            else self._mask_kv_len_host
+        )
+        bits = qo_lens * widths
+        indptr = torch.zeros(len(bits) + 1, dtype=torch.int32)
+        indptr[1:] = torch.cumsum((bits + 7) // 8 if suffix else bits, 0)
+        indptr = indptr.to(self.device)
+        if custom_mask is not None:
+            if custom_mask.dtype != torch.bool:
+                raise ValueError("custom_mask must have bool dtype.")
+            packed, indptr = segment_packbits(
+                custom_mask.contiguous().view(-1).to(self.device),
+                indptr,
+                bitorder="little",
+            )
+        else:
+            packed = causal_custom_mask if suffix else packed_custom_mask
+            if packed.dtype != torch.uint8:
+                raise ValueError("Packed custom masks must have uint8 dtype.")
+            packed = packed.to(self.device)
+            if not suffix:
+                # Packed input is independently byte-aligned for each request.
+                indptr = torch.zeros(len(bits) + 1, dtype=torch.int32)
+                indptr[1:] = torch.cumsum((bits + 7) // 8, 0)
+                indptr = indptr.to(self.device)
+        kv_len = (
+            causal_custom_mask_kv_len.to(self.device)
+            if causal_custom_mask_kv_len is not None
+            else None
+        )
+        return (
+            MaskMode.CAUSAL_CUSTOM.value if suffix else MaskMode.CUSTOM.value,
+            (packed, indptr, kv_len),
+        )
 
 
 _FaBackendT = TypeVar("_FaBackendT", bound="_BatchMLAPagedAttentionFaBackendBase")
@@ -614,6 +696,10 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if kv_len is not None:
             raise ValueError("kv_len is only supported with cutlass backend.")
@@ -638,4 +724,8 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             ckv_scale=ckv_scale,
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
+            custom_mask=custom_mask,
+            packed_custom_mask=packed_custom_mask,
+            causal_custom_mask=causal_custom_mask,
+            causal_custom_mask_kv_len=causal_custom_mask_kv_len,
         )

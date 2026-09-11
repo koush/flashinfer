@@ -958,6 +958,21 @@ inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int clu
              0);
 }
 
+inline int packed_causal_kv_end_cp(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
+                                   int num_qo_tiles, int num_heads, int cp_world_size, int cp_rank,
+                                   int global_kv_len) {
+  if (qo_tile_idx + 1 == num_qo_tiles) {
+    return kv_len;
+  }
+  int q_last_packed = (qo_tile_idx + 1) * cluster_tile_q - 1;
+  int q_last_pos = q_last_packed / num_heads;
+  if (q_last_pos >= qo_len) q_last_pos = qo_len - 1;
+  int global_kv_boundary = (global_kv_len - qo_len) + q_last_pos;
+  int local_kv_boundary =
+      (global_kv_boundary >= cp_rank) ? (global_kv_boundary - cp_rank) / cp_world_size + 1 : 0;
+  return min(kv_len, max(local_kv_boundary, 0));
+}
+
 struct PrefillPlanSM90Info {
   int64_t qo_tile_indices_offset;
   int64_t qo_indptr_offset;
@@ -1525,6 +1540,7 @@ struct MLAPlanInfo {
   int64_t kv_start_offset;
   int64_t kv_end_offset;
   int64_t work_indptr_offset;
+  int64_t batch_indices_offset;
   int64_t partial_o_offset;
   int64_t partial_lse_offset;
 
@@ -1545,14 +1561,15 @@ struct MLAPlanInfo {
             kv_start_offset,
             kv_end_offset,
             work_indptr_offset,
+            batch_indices_offset,
             partial_o_offset,
             partial_lse_offset};
   }
 
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 18) {
+    if (vec.size() != 19) {
       std::ostringstream err_msg;
-      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 18, but got " << vec.size();
+      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     num_blks_x = vec[0];
@@ -1571,8 +1588,9 @@ struct MLAPlanInfo {
     kv_start_offset = vec[13];
     kv_end_offset = vec[14];
     work_indptr_offset = vec[15];
-    partial_o_offset = vec[16];
-    partial_lse_offset = vec[17];
+    batch_indices_offset = vec[16];
+    partial_o_offset = vec[17];
+    partial_lse_offset = vec[18];
   }
 };
 
@@ -1583,7 +1601,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                            size_t& staged_int_workspace_bytes, IdType* qo_indptr_h,
                            IdType* kv_indptr_h, IdType* kv_len_arr_h, uint32_t batch_size,
                            uint32_t num_heads, uint32_t head_dim_o, bool causal,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, uint32_t cp_world_size = 0, uint32_t cp_rank = 0) {
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1591,7 +1609,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   // step 0. determine the number of blocks in x and y dimensions
   int accum_packed_qo_len = 0;
-  std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec;
+  std::vector<std::tuple<int, int, int, int>> idx_qo_kv_len_vec;
   for (uint32_t i = 0; i < batch_size; ++i) {
     if (qo_indptr_h[i + 1] - qo_indptr_h[i] < 0) {
       std::ostringstream err_msg;
@@ -1604,8 +1622,12 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int packed_qo_len = qo_len * num_heads;
     accum_packed_qo_len += packed_qo_len;
 
-    int kv_len = kv_len_arr_h[i];
-    idx_qo_kv_len_vec.push_back({i, qo_len, kv_len});
+    int kv_len =
+        cp_world_size
+            ? (kv_len_arr_h[i] / cp_world_size + (kv_len_arr_h[i] % cp_world_size > cp_rank))
+            : kv_len_arr_h[i];
+    int global_kv_len = kv_len_arr_h[i];
+    idx_qo_kv_len_vec.push_back({i, qo_len, kv_len, global_kv_len});
   }
   int avg_packed_qo_len = accum_packed_qo_len / batch_size;
 
@@ -1622,13 +1644,21 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int cluster_tile_q = cluster_size * cta_tile_q;
 
   int64_t total_kv_lens = 0;
-  for (auto& [_, qo_len, kv_len] : idx_qo_kv_len_vec) {
+  for (auto& [_, qo_len, kv_len, global_kv_len] : idx_qo_kv_len_vec) {
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int effective_kv_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
-                                                           cluster_tile_q, num_qo_tiles, num_heads)
-                                    : kv_len;
+      int effective_kv_len;
+      if (causal) {
+        effective_kv_len =
+            (cp_world_size > 0)
+                ? packed_causal_kv_end_cp(qo_len, kv_len, qo_tile_idx, cluster_tile_q, num_qo_tiles,
+                                          num_heads, cp_world_size, cp_rank, global_kv_len)
+                : packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q, num_qo_tiles,
+                                       num_heads);
+      } else {
+        effective_kv_len = kv_len;
+      }
       total_kv_lens += effective_kv_len;
     }
   }
@@ -1657,7 +1687,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       cluster_q_start(num_clusters, std::vector<IdType>()),
       cluster_kv_start(num_clusters, std::vector<IdType>()),
       cluster_kv_end(num_clusters, std::vector<IdType>()),
-      cluster_partial_indptr(num_clusters, std::vector<IdType>());
+      cluster_partial_indptr(num_clusters, std::vector<IdType>()),
+      cluster_batch_indices(num_clusters, std::vector<IdType>());
 
   std::vector<IdType> merge_packed_offset_start(num_sm, 0), merge_packed_offset_end(num_sm, 0),
       merge_partial_packed_offset_start(num_sm, 0), merge_partial_packed_offset_end(num_sm, 0),
@@ -1666,13 +1697,21 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int merge_cta_counter = 0;
   int partial_o_nnz = 0;
 
-  for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
+  for (auto& [i, qo_len, kv_len, global_kv_len] : idx_qo_kv_len_vec) {
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int remaining_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
-                                                        num_qo_tiles, num_heads)
-                                 : kv_len;
+      int remaining_len;
+      if (causal) {
+        remaining_len =
+            (cp_world_size > 0)
+                ? packed_causal_kv_end_cp(qo_len, kv_len, qo_tile_idx, cluster_tile_q, num_qo_tiles,
+                                          num_heads, cp_world_size, cp_rank, global_kv_len)
+                : packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q, num_qo_tiles,
+                                       num_heads);
+      } else {
+        remaining_len = kv_len;
+      }
       int kv_start = 0;
       bool split_kv = remaining_len > kv_len_limit;
       int row_tile_size = std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
@@ -1715,7 +1754,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_cost_heap.insert(
             {cluster_idx, accum_cost + cost_function(cluster_tile_q, actual_len)});
         cluster_q_len[cluster_idx].push_back(qo_len);
-        cluster_kv_len[cluster_idx].push_back(kv_len);
+        cluster_kv_len[cluster_idx].push_back(global_kv_len);
         cluster_q_indptr[cluster_idx].push_back(qo_indptr_h[i]);
         cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
         if (split_kv) {
@@ -1727,6 +1766,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
         cluster_kv_start[cluster_idx].push_back(kv_start);
         cluster_kv_end[cluster_idx].push_back(kv_start + actual_len);
+        cluster_batch_indices[cluster_idx].push_back(i);
         remaining_len -= actual_len;
         kv_start += actual_len;
         if (zero_kv_len) break;
@@ -1753,6 +1793,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   auto q_start_vec = flatten(cluster_q_start, total_num_works);
   auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
   auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
+  auto batch_indices_vec = flatten(cluster_batch_indices, total_num_works);
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
   plan_info.q_indptr_offset =
@@ -1783,6 +1824,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_kv_end");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "mla_work_indptr");
+  plan_info.batch_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "mla_batch_indices");
 
   IdType* cluster_q_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.q_indptr_offset);
@@ -1812,6 +1855,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_end_offset);
   IdType* cluster_work_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.work_indptr_offset);
+  IdType* cluster_batch_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.batch_indices_offset);
 
   std::copy(q_indptr_vec.begin(), q_indptr_vec.end(), cluster_q_indptr_h);
   std::copy(kv_indptr_vec.begin(), kv_indptr_vec.end(), cluster_kv_indptr_h);
@@ -1832,6 +1877,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   std::copy(kv_start_vec.begin(), kv_start_vec.end(), cluster_kv_start_h);
   std::copy(kv_end_vec.begin(), kv_end_vec.end(), cluster_kv_end_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), cluster_work_indptr_h);
+  std::copy(batch_indices_vec.begin(), batch_indices_vec.end(), cluster_batch_indices_h);
 
   staged_int_workspace_bytes = int_allocator.num_allocated_bytes();
 

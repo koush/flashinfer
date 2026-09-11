@@ -33,7 +33,10 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
                                TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                int64_t num_heads, int64_t page_size, double sm_scale,
                                bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
-                               Optional<TensorView> maybe_ckv_scale_arr);
+                               Optional<TensorView> maybe_ckv_scale_arr,
+                               Optional<TensorView> maybe_custom_mask,
+                               Optional<TensorView> maybe_mask_indptr,
+                               Optional<TensorView> maybe_mask_kv_len);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionPlan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchMLAPagedAttentionRun);

@@ -706,6 +706,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     # Output-and-LSE form -- ``return_lse=True`` returns ``(output, lse)``.
@@ -727,6 +731,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     # Deprecated separate-tensor output-only form. Pass split pairs through
@@ -750,6 +758,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     # Deprecated separate-tensor output-and-LSE form. Pass split pairs through
@@ -773,6 +785,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @_warn_on_positional_mla_arguments
@@ -797,6 +813,10 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale: Optional[float] = None,
         ckv_scale_arr: Optional[torch.Tensor] = None,
         kpe_scale: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask: Optional[torch.Tensor] = None,
+        causal_custom_mask_kv_len: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run one planned MLA attention request.
 
@@ -864,6 +884,18 @@ class BatchMLAPagedAttentionWrapper:
         ckv_scale, ckv_scale_arr, kpe_scale : optional
             Per-tensor or per-token FP8 KV-cache scales required by plans that
             selected ``scale_mode="kv-per-tensor"``.
+        custom_mask, packed_custom_mask : Optional[torch.Tensor]
+            FA2-only masks, flattened request-by-request in query-major order.
+            ``custom_mask`` is boolean (True allows attention); packed masks
+            use little-endian bits with each request independently byte-aligned.
+            Use a noncausal plan for masks that allow future tokens.
+        causal_custom_mask : Optional[torch.Tensor]
+            FA2-only packed suffix mask. Prefix keys remain causal; the suffix
+            uses the supplied little-endian mask, including allowed future keys.
+            The three mask forms are mutually exclusive.
+        causal_custom_mask_kv_len : Optional[torch.Tensor]
+            Per-request int32 suffix width, defaulting to the query length.
+            Requires ``causal_custom_mask``; may extend into cached prefix keys.
 
         Notes
         -----
@@ -903,6 +935,24 @@ class BatchMLAPagedAttentionWrapper:
         # Resolve plan state and handle legacy unplanned CUTLASS
         # ---------------------------------------------------------------------------
         planned_backend = getattr(self, "_planned_backend", None)
+        mask_options = {}
+        if any(
+            x is not None
+            for x in (
+                custom_mask,
+                packed_custom_mask,
+                causal_custom_mask,
+                causal_custom_mask_kv_len,
+            )
+        ):
+            if getattr(planned_backend, "_backend", None) != "fa2":
+                raise ValueError("Custom MLA masks require the fa2 backend.")
+            mask_options = dict(
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                causal_custom_mask=causal_custom_mask,
+                causal_custom_mask_kv_len=causal_custom_mask_kv_len,
+            )
         is_unplanned_cutlass = planned_backend is None and self._backend == "cutlass"
         if planned_backend is None and not is_unplanned_cutlass:
             raise RuntimeError(
@@ -1063,6 +1113,7 @@ class BatchMLAPagedAttentionWrapper:
             ckv_scale=ckv_scale,
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
+            **mask_options,
         )
 
 

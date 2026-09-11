@@ -528,8 +528,8 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
+    return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
@@ -549,8 +549,8 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                     cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
+    return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
@@ -570,8 +570,8 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                    cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  if (MASK_MODE == MaskMode::kCustom || MASK_MODE == MaskMode::kCausalCustom) {
+    return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
