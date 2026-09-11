@@ -306,7 +306,7 @@ inline bool dispatch_v32_swapab(int num_heads, int topk, int page_block_size, co
 }
 
 // SG (single-group, 16 heads/CTA). PBS=64 matches the V32 decode
-// (`decode_dsv3_2_kernel.cuh`). NH=8 covers small-TP shards; the SG kernel
+// (`decode_dsv3_2_kernel.cuh`). NH=1/4/8 covers small-TP shards; the SG kernel
 // zero-pads invalid head slots up to HPB=16 internally and gates write-back
 // by VALID_HPB.
 template <ModelType MT>
@@ -317,6 +317,18 @@ inline bool dispatch_v32_sg(int num_heads, int topk, int page_block_size, const 
                             const int* topk_length_ptr, cudaStream_t stream,
                             const bf16* Q_rope_split, const float* Q_scales) {
   if (page_block_size != 64) return false;
+  if (num_heads == 1) {
+    launch_prefill_sg<MT, ComputeMode::FP8, 1, 64>(
+        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block,
+        stride_out_lse, topk_length_ptr, stream, Q_rope_split, Q_scales);
+    return true;
+  }
+  if (num_heads == 4) {
+    launch_prefill_sg<MT, ComputeMode::FP8, 4, 64>(
+        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block,
+        stride_out_lse, topk_length_ptr, stream, Q_rope_split, Q_scales);
+    return true;
+  }
   if (num_heads == 8) {
     launch_prefill_sg<MT, ComputeMode::FP8, 8, 64>(
         Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block,

@@ -7,7 +7,7 @@
 // × num_splits). Reuses decode-dsv4's merge kernel for split combine.
 //
 // Supports the V32-family dispatch grid: dedicated instantiations at
-//   num_heads ∈ {8, 16, 32, 64, 128}
+//   num_heads ∈ {1, 4, 8, 16, 32, 64, 128}
 // plus one runtime-H instantiation (any num_heads <= 128 off the grid) and
 // GLM53_NOPE dedicated 32/64 + runtime-H. topk is a runtime argument — one
 // instantiation serves every indices-row width.
@@ -136,7 +136,7 @@ static bool launch_decode_dsv3_2_impl(
 
 // Public surface: V32-family (DSv3.2 / GLM_NSA / GLM53_NOPE) decode.
 // topk is a runtime kernel argument (the indices-row width); dispatch
-// switches on num_heads only. The production grid {8, 16, 32, 64, 128} keeps
+// switches on num_heads only. The grid {1, 4, 8, 16, 32, 64, 128} keeps
 // dedicated instantiations (measured 0.9-2.5% faster than runtime-H on hot
 // shapes); every other num_heads <= 128 falls back to one runtime-H
 // instantiation.
@@ -173,6 +173,9 @@ bool launch_sparse_mla_decode_dsv3_2(
       DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H) \
     }                                           \
   } while (0);
+  // GLM's direct launcher uses true-head scratch for these small shards too.
+  DSV3_2_DISPATCH(1)
+  DSV3_2_DISPATCH(4)
   DSV3_2_DISPATCH(8)
   DSV3_2_DISPATCH(16)
   DSV3_2_DISPATCH(32)

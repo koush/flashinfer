@@ -154,7 +154,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // num_heads <= 128): Q/output carry the true num_heads stride, the mid
   // scratch is HPB-aligned (gridDim.y * HPB rows per token) so both tile
   // halves write back unconditionally, and the merge kernel reads only
-  // h < num_heads. The dedicated NUM_HEADS=8 instantiation keeps true-H
+  // h < num_heads. The dedicated small-head instantiations keep true-H
   // scratch, making the second-half writeback a compile-time skip; the kernel
   // still computes a full HPB×CAND tile internally (zero-padded Q rows on
   // invalid heads).
@@ -668,8 +668,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
           __floats2bfloat162_rn(acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
       const __nv_bfloat162 pair_hi =
           __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
-      *reinterpret_cast<__nv_bfloat162*>(
-          &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      if (gid < VALID_HPB) {
+        *reinterpret_cast<__nv_bfloat162*>(
+            &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      }
       if constexpr (VALID_HPB > 8) {
         *reinterpret_cast<__nv_bfloat162*>(
             &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
@@ -680,7 +682,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
     const size_t lse_base = (size_t)t_idx * mid_heads * num_splits + (size_t)h_start * num_splits;
-    mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
+    if (gid < VALID_HPB) mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
     }
