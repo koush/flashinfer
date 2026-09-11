@@ -1651,7 +1651,10 @@ def test_sparse_mla_sm120_decode_glm_nsa_arbitrary_fp32() -> None:
 
 
 @pytest.mark.parametrize("num_heads", [8, 32, 64, 128])
-def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None:
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(
+    num_heads: int, with_sink: bool
+) -> None:
     torch.manual_seed(2)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
@@ -1679,7 +1682,10 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
     )
     indices[:, topk // 2 :] = -1
     sm_scale = d_qk**-0.5
-    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+    attn_sink = torch.linspace(5, 9, num_heads, device=device) if with_sink else None
+    ref_out, ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
 
     output = torch.zeros(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
@@ -1695,6 +1701,7 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
         sm_scale,
         d_v=d_v,
         kv_scale_format="arbitrary_fp32",
+        attn_sink=attn_sink,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)

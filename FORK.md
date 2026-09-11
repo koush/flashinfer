@@ -61,13 +61,41 @@ runtime-H fallback would change their layout.
 
 - The fork's subgroup-based online Q quantizer is replaced by upstream's
   vectorized, register-based quantizer.
-- Old H8 weight-pass packing and padded-head compute-pruning optimizations
-  were not copied into the rewritten kernels. The compact-store bounds needed
-  for correctness are retained separately.
+- H8 weight-pass packing and padded-head compute pruning were initially
+  omitted during the reapplication. Both are now restored for GLM_NSA H8 SG
+  prefill; see below. The compact-store bounds remain a separate change.
 - The old split-Q MG repair is incorporated into the new shared Q-loading
   paths, including the newly introduced swapAB register path.
 - Upstream's prefill handshake and swapAB spectator-warp fixes are inherited
   from the base; no separate backports are needed.
+
+## Restored H8 SG specialization
+
+`prefill_mg_kernel.cuh` specializes the SG kernel when `MT == GLM_NSA` and
+`NUM_HEADS == 8`. The unused upper eight heads are excluded from softmax,
+scale atomics/reductions, persistent accumulator updates and output staging.
+The XV weight matrix instead stores the high FP8 approximation in rows 0–7
+and its low residual in rows 8–15. One m16 MMA pass computes both contributions,
+which are folded into the eight real output heads. The upper scale slots cache
+reciprocals for those real heads.
+
+The specialization retains upstream's alternating IO handshake and all
+producer/consumer synchronization needed for shared-memory reuse. Decode,
+MG, swapAB and other model families do not use this specialization.
+
+Validation: 35 native query/sparse-MLA tests; nine upstream prefill cases,
+including attention sinks; and a targeted H8 CUDA memcheck run with zero errors.
+H8 coverage includes lengths 0/1/63/65/129/256/2048, an independent quantized
+attention reference, comparison with the unoptimized H16 SG kernel, and fresh-Q
+graph replay. Packed passes change FP32 accumulation order: the H16 comparison
+checks output NRMSE below 0.003 and exact LSE equality. No throughput claim is
+made from these correctness checks.
+
+A subsequent live smoke test overlapped a separately running server benchmark
+and encountered an illegal memory access reported during an MTP draft step.
+The executor was restored and healthy. Live testing was stopped to avoid
+interfering with the benchmark; the mixed-load failure has not been isolated
+or attributed to this specialization.
 
 ## Numerical compatibility
 
