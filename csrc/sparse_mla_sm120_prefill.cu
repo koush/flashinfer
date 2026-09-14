@@ -44,6 +44,7 @@
 // only re-checks its own envelope. Raw-pointer interface; framework-agnostic.
 
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 
 #include <flashinfer/attention/sparse_mla_sm120/arch/common.cuh>
@@ -91,8 +92,16 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   dim3 block(Cfg::BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE>;
-  static bool configured[kMaxCachedCudaDevices] = {};
-  configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
+  int variant = 0;
+  if constexpr (MT == ModelType::GLM_NSA && NUM_HEADS == 8 && CM == ComputeMode::FP8) {
+    const char* swap_qk = std::getenv("FLASHINFER_GLM_H8_PREFILL_SWAP_QK");
+    if (swap_qk && swap_qk[0] == '0') {
+      kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, false>;
+      variant = 1;
+    }
+  }
+  static bool configured[2][kMaxCachedCudaDevices] = {};
+  configure_dynamic_smem_per_device(kernel, smem_bytes, configured[variant]);
 
   // SG is single-cache only.
   PrefillColdParams cold{sm_scale,

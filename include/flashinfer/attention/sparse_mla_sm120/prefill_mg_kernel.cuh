@@ -29,6 +29,7 @@
 #pragma once
 
 #include "prefill_common.cuh"
+#include "common/glm_h8_qk.cuh"
 // ============================================================================
 // Sparse MLA Prefill Kernel — single-pass (no split-KV, no combine)
 //
@@ -514,7 +515,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   }
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE, bool H8_SWAP_QK = true>
 __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
@@ -533,10 +534,10 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
   static constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
   static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
-  // GLM H8 has only eight real rows in the m16 tile. Keep full-width MMAs,
-  // prune scalar work for padded heads, and reuse the upper XV rows for the
-  // low FP8 weight residual instead of issuing a second MMA pass.
+  // GLM H8 prunes padded scalar work and packs the low FP8 residual into the
+  // upper XV rows. Its FP8 QK specialization also swaps candidate/head roles.
   constexpr bool H8_SPECIALIZED = MT == ModelType::GLM_NSA && NUM_HEADS == 8;
+  constexpr bool SWAP_H8 = H8_SPECIALIZED && CM == ComputeMode::FP8 && H8_SWAP_QK;
   constexpr int ACTIVE_HPB = H8_SPECIALIZED ? 8 : HPB;
   static_assert(!H8_SPECIALIZED || (!Cfg::SPLIT_QK_XV && !KV::V_HAS_ROPE));
   // smem layout always allocates HPB heads (zero-padded for invalid slots);
@@ -661,7 +662,10 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
                                                 VALID_HPB, q_rope_base, q_scales);
     }
-    QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
+    QRopeRegs<MT> q_rope_regs;
+    if constexpr (!SWAP_H8) {
+      q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
+    }
 
     float acc_o[CT::ACC_TILES][4];
 #pragma unroll
@@ -691,12 +695,24 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
         sm.w_head_sc_all[(i / ACTIVE_HPB) * HPB + i % ACTIVE_HPB] = 0.f;
 
       float s[4] = {0.f, 0.f, 0.f, 0.f};
-      if (qk_warp) {
+      if constexpr (SWAP_H8) {
+        static_assert(Cfg::BI == 64 && Cfg::QK_WARPS == 8);
+        static_assert(CT::N_V_CHUNKS * L::SMEM_W_FP8_ONE >= 64 * 8 * sizeof(float));
+        if (mwarp < 4) {
+          flashinfer::sparse_mla_sm120::glm_h8_prefill_qk<PAGE_BLOCK_SIZE>(
+              reinterpret_cast<float*>(sm.w_fp8), sm.reduce_buf, sm.q_nope_fp8, sm.q_nope_sc,
+              sm.q_rope, kv_smem, KV_cache, ib, stride_kv_block, topk_len - ti * Cfg::BI,
+              sm_scale_log2e, mwarp, lane);
+        }
+      }
+      if (qk_warp && !SWAP_H8) {
         uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-        const int idx_rope = ib[qk_nb + gid];
         const int mask0 = ib[qk_nb + tid * 2];
         const int mask1 = ib[qk_nb + tid * 2 + 1];
+
+        float qk[4] = {0.f, 0.f, 0.f, 0.f};
+        const int idx_rope = ib[qk_nb + gid];
 
         // Only this lane's own entry is needed for the QK rope prefetch — the
         // XV rope MMA re-derives its addresses from `ib` inside xv_rope_mma.
@@ -707,7 +723,6 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
             reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
 
         // ── QK nope MMA ─────────────────────
-        float qk[4] = {0.f, 0.f, 0.f, 0.f};
         const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
         if constexpr (CM == ComputeMode::BF16) {
           // BF16 m16n8k16 with per-thread FP8→BF16 dequant on KV.
@@ -832,13 +847,21 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       }  // qk_warp
       bar_sync_t<2, Cfg::MATH_THREADS>();
 
+      if constexpr (SWAP_H8) {
+        // The existing maxima handoff also publishes the converted scores.
+        // No extra synchronization is needed before reusing W scratch below.
+        const float* scores = reinterpret_cast<const float*>(sm.w_fp8);
+        s[0] = scores[(qk_nb + tid * 2) * 8 + gid];
+        s[1] = scores[(qk_nb + tid * 2 + 1) * 8 + gid];
+      }
+
       // Redundant per-thread reduction over the QK warps' row maxima. Every
       // math thread holds heads gid and gid+8, so each reads QK_WARPS pairs
       // and updates its own running max; identical ops on identical inputs
       // keep this bitwise-equal to the old single-warp reduction.
       float tm0 = -1e30f, tm1 = -1e30f;
 #pragma unroll
-      for (int w = 0; w < Cfg::QK_WARPS; w++) {
+      for (int w = 0; w < (SWAP_H8 ? 4 : Cfg::QK_WARPS); w++) {
         tm0 = fmaxf(tm0, sm.reduce_buf[w * HPB + gid]);
         if constexpr (!H8_SPECIALIZED) tm1 = fmaxf(tm1, sm.reduce_buf[w * HPB + gid + 8]);
       }

@@ -5,6 +5,8 @@
 // 288 threads), TMA bulk gather of FP8 INLINE 656 B/token KV cache, double
 // buffered with per-buffer mbarrier pairs, static grid (num_tokens × HBLOCKS
 // × num_splits). Reuses decode-dsv4's merge kernel for split combine.
+// GLM_NSA with eight heads uses the native 1 IO + 4 math warp specialization.
+// FLASHINFER_GLM_H8_NATIVE=0 restores the generic path for A/B comparisons.
 //
 // Supports the V32-family dispatch grid: dedicated instantiations at
 //   num_heads ∈ {1, 4, 8, 16, 32, 64, 128}
@@ -15,6 +17,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <flashinfer/attention/sparse_mla_sm120/decode_glm_h8_kernel.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/decode_dsv3_2_kernel.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/decode_dsv4_kernel.cuh>  // merge kernel
 #include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
@@ -70,6 +74,14 @@ static bool launch_decode_dsv3_2_impl(
       + 2 * HPB * (DSV3_2_BI + 16);                                       // sm_w_fp8 ×2
 
   auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, 64>;
+  int block_threads = DSV3_2_BLOCK_THREADS;
+  if constexpr (MT == ModelType::GLM_NSA && NUM_HEADS == 8) {
+    const char* native_h8 = std::getenv("FLASHINFER_GLM_H8_NATIVE");
+    if (!native_h8 || native_h8[0] != '0') {
+      kernel = sparse_mla_decode_glm_h8_kernel<64>;
+      block_threads = GLM_H8_THREADS;
+    }
+  }
   DSV3_2_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
@@ -112,7 +124,7 @@ static bool launch_decode_dsv3_2_impl(
   // early after marking LSE = -1e30f — keeps mid_out/mid_lse stride aligned
   // with wrapper allocation.
   dim3 grid1(num_tokens, h_blocks, num_splits);
-  dim3 block1(DSV3_2_BLOCK_THREADS);
+  dim3 block1(block_threads);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
       chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row,
