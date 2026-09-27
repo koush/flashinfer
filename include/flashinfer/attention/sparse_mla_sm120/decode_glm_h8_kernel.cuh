@@ -79,6 +79,10 @@ __global__ void __launch_bounds__(GLM_H8_THREADS) sparse_mla_decode_glm_h8_kerne
     }
     return;
   }
+  // Slots, lengths, and KV must be ready independently of the upstream Q
+  // gather. Let IO stage KV while only the math warps wait before loading Q.
+  cudaGridDependencySynchronize();
+
   const size_t qhead = (size_t)t * 8;
   quantize_q_to_smem<MT, MATH_THREADS>(
       sm.q_fp8(), sm.q_sc(), sm.q_rope(), query_head_ptr<MT>(Q, qhead, Q_rope_split, Q_scales),
