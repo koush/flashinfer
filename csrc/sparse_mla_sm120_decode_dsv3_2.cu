@@ -125,10 +125,14 @@ static bool launch_decode_dsv3_2_impl(
   // with wrapper allocation.
   dim3 grid1(num_tokens, h_blocks, num_splits);
   dim3 block1(block_threads);
-  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config{grid1, block1, DYN_SMEM_BYTES, stream, &attr, 1};
+  DSV3_2_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel,
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
       chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row,
-      Q_rope_split, Q_scales);
+      Q_rope_split, Q_scales));
   DSV3_2_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).

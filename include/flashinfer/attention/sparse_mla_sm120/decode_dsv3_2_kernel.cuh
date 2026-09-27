@@ -197,6 +197,11 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     return;
   }
 
+  // topk_length must already be ready independently of the upstream Q gather.
+  // Retire inactive splits before waiting so they do not occupy SMs while Q
+  // completes. Active splits retain the existing Q/KV loading order.
+  cudaGridDependencySynchronize();
+
   constexpr int V_CHUNK = QUANT_TILE;                           // 128
   constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                  // 4
   constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV3_2_N_WARPS;  // 2
