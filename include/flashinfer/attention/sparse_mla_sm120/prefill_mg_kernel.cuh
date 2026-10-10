@@ -515,7 +515,8 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   }
 }
 
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE, bool H8_SWAP_QK = true>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int PAGE_BLOCK_SIZE, bool H8_SWAP_QK = true,
+          bool H8_DIRECT_KV = true>
 __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
@@ -568,6 +569,17 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
   extern __shared__ char smem_raw[];
   auto sm = SmemPtrs<MT, CM, Cfg::BI, Cfg::MATH_WARPS>::init(smem_raw);
 
+  auto kv_buffer = [&](int buf) {
+    if constexpr (H8_SPECIALIZED && H8_DIRECT_KV) {
+      // Dynamic indexing of SmemPtrs::kv_bufs materializes the pointer table
+      // in local memory and loses shared-address provenance in downstream
+      // loads. Derive the alternating buffer from the shared base instead.
+      return reinterpret_cast<uint8_t*>(smem_raw + L::OFF_KV0 + buf * L::SMEM_KV_BUF);
+    } else {
+      return sm.kv_bufs[buf];
+    }
+  };
+
   if (threadIdx.x == 0) {
     mbarrier_init(sm.mbar_kv + 0, 1);
     mbarrier_init(sm.mbar_kv + 1, 1);
@@ -600,7 +612,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
           sm.kv_scale_bufs[buf], staged, KV_cache, io_tid, stride_kv_block);
       __threadfence_block();
       io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid, stride_kv_block,
+          kv_buffer(buf), staged, KV_cache, sm.mbar_kv + buf, io_tid, stride_kv_block,
           kv_l2_policy);
     };
 
@@ -688,7 +700,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
 // ── Main loop — QK + softmax + XV ───────────────────────────
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
-      uint8_t* kv_smem = sm.kv_bufs[ti & 1];
+      uint8_t* kv_smem = kv_buffer(ti & 1);
       const int32_t* ib = idx_base + ti * Cfg::BI;
 
       for (int i = threadIdx.x; i < CT::N_V_CHUNKS * ACTIVE_HPB; i += Cfg::MATH_THREADS)

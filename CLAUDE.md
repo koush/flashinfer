@@ -642,6 +642,11 @@ For GLM_NSA SG prefill with eight heads and FP8 QK, the launcher in
 for A/B comparisons; both variants retain padded-head pruning and packed PV
 precision passes. Recreate cached CUDA graphs when changing this setting.
 
+GLM_NSA H8 SG prefill also derives alternating KV-buffer addresses directly
+from the shared-memory base, avoiding a local-memory pointer table.
+`FLASHINFER_GLM_H8_PREFILL_DIRECT_KV=0` restores pointer-table addressing for
+A/B comparisons. Recreate cached CUDA graphs when changing this setting.
+
 ##### Experimental KDA Output-Only Decode Tuning
 
 Low-level overrides for the output-only / RecoverSSM-verify KDA decode

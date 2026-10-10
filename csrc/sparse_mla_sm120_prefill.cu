@@ -100,7 +100,16 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
       variant = 1;
     }
   }
-  static bool configured[2][kMaxCachedCudaDevices] = {};
+  if constexpr (MT == ModelType::GLM_NSA && NUM_HEADS == 8) {
+    const char* direct_kv = std::getenv("FLASHINFER_GLM_H8_PREFILL_DIRECT_KV");
+    if (direct_kv && direct_kv[0] == '0') {
+      kernel = variant == 1
+                   ? sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, false, false>
+                   : sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, PAGE_BLOCK_SIZE, true, false>;
+      variant += 2;
+    }
+  }
+  static bool configured[4][kMaxCachedCudaDevices] = {};
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured[variant]);
 
   // SG is single-cache only.

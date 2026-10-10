@@ -97,6 +97,23 @@ The executor was restored and healthy. Live testing was stopped to avoid
 interfering with the benchmark; the mixed-load failure has not been isolated
 or attributed to this specialization.
 
+### H8 direct shared-KV addressing
+
+GLM_NSA H8 SG prefill derives alternating KV-buffer pointers from the shared
+base and layout offsets. Dynamic indexing of `SmemPtrs::kv_bufs` previously
+materialized a 128-byte local-memory pointer table and caused downstream
+generic-address loads. Direct addressing removes the stack table and enables
+shared-memory loads, without changing the attention arithmetic or barriers.
+`FLASHINFER_GLM_H8_PREFILL_DIRECT_KV=0` selects the prior addressing for A/B
+comparisons; cached graphs must be recreated after changing the setting.
+
+On SM120, 4096-query/H8/top-k-2048 synthetic tests measured 6.4–9.9% higher
+kernel throughput across Workstation/Max-Q GPUs and 2k/128k cached tokens.
+Full output and LSE buffers were bitwise equal. GLM.js regression tests cover
+both QK layouts, packed/split/prequantized queries, partial tiles, masking,
+and changed-input graph replay. A same-process 128k phased-prefill ABBA run
+measured approximately 2.0% higher throughput, with visible timing drift.
+
 ## Numerical compatibility
 
 Upstream swapAB's online BF16 GLM Q quantizer uses arbitrary FP32 scales.
