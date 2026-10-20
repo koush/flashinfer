@@ -825,6 +825,15 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_NVFP4_4OVER6_E4M3_USE_256` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` treats 256, not the full-range 448, as the top of the E4M3 block-scale range: the per-tensor global scale becomes `256 * 6 / amax` (per-token: `1 / (256 * 6)`) and the kernel's error normalization follows. This is what keeps the 1.5x-larger `amax / 4` candidate representable — `256 * 1.5 = 384` still fits E4M3, whereas a 448-based scale would need `672` and saturate for blocks near the tensor amax. The global scale **must** be built from the same recipe (`make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`); a mismatch silently rescales the whole tensor. Same gating as `FLASHINFER_NVFP4_4OVER6_ERR_MODE`. Parameter spelling: `NVFP44Over6Config(e4m3_max=256)`. |
 | `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | `1` makes the NVFP4 quantizer derive its block/global scales with IEEE round-to-nearest arithmetic (`fdiv_rn`, `nvfp4_scale_from_amax_rn`) instead of the default fast approximate reciprocal (`rcp_approx_ftz`). Slower, but reproduces a reference implementation bit-exactly — use it when bisecting an NVFP4 accuracy mismatch. The flag is part of the CuTe-DSL specialization name (`_nofastmath` suffix), so toggling it compiles a separate kernel rather than reusing the cached one. The C++ side (`getEnvDisableFP4QuantFastMath()`) also accepts TRT-LLM's `TRTLLM_DISABLE_FP4_QUANT_FAST_MATH` as an alias. |
 
+##### GLM.js fork
+
+See `FORK.md` for the sparse-query and compact-head native interface extensions.
+`FLASHINFER_SPARSE_MLA_STANDALONE` builds the resolver without TVM exports.
+`FLASHINFER_GLM_H8_NATIVE=0` selects generic H8 decode;
+`FLASHINFER_GLM_H8_PREFILL_SWAP_QK=0` selects conventional H8 QK. Both default
+to the specialized route. Recreate CUDA graphs when changing these settings.
+The old H8 direct-KV toggle is superseded by upstream's shared-memory layout.
+
 ##### Experimental KDA Output-Only Decode Tuning
 
 Low-level overrides for the output-only / RecoverSSM-verify KDA decode
