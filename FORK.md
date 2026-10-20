@@ -12,7 +12,16 @@ SM120 execution/kernel layout. The previous fork remains on
 | `a664d0ff` | Split BF16 queries and prequantized FP8 NoPE queries with separate BF16 RoPE and FP32 scales, in decode and SG/MG/swapAB prefill. |
 | `d4fa734f` | Dedicated one-/four-head V32 dispatch, bounded stores and true-head decode scratch. |
 | `12440fb3`, `27fb57ba` | GLM H8 SG padded-head pruning and packed high/residual PV passes; candidate-major H8 QK and specialized H8 decode. |
-| `db5f45cd`, `f87c9e6f` | PDL decode consumption: IO stages independent KV while math waits for Q. Launch and device-side wait are limited to grids of at most 64 blocks, matching the parent project's peer-progress constraint. |
+| `db5f45cd`, `f87c9e6f` | PDL decode consumption: IO stages independent KV while math waits for Q. Launch and device-side wait are limited to grids of at most 64 blocks, matching the parent project's peer-progress constraint. Extended to `ModelType::DSV4` decode, counting allocated scratch splits in the grid bound. |
+
+The DSV4 PDL extension enables programmatic stream serialization and waits in
+the math warps immediately before Q staging; independent KV, index, and length
+reads can overlap the preceding Q producer. Larger grids retain ordinary stream
+ordering. Validation: parent `npm run build:all`, H8/H16 captured decode reference
+checks at 1/4/8/16 rows, and memcheck with 64 allocated splits at 1/2 rows (64/128
+blocks, exercising both sides of the limit) passed with zero memory errors.
+Standalone attention replay does not measure producer/consumer overlap; the
+end-to-end performance effect remains to be measured.
 
 The dense MLA context-parallel/custom-mask patch (`c807cd1c`) is retired.
 GLM.js removed that inactive implementation before this migration. Its sparse

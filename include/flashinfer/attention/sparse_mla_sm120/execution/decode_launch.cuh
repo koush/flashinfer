@@ -55,13 +55,21 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
     else
       return p.page_size;
   }();
-  kernel<<<dim3(p.num_tokens, h_blocks, p.allocated_splits), dim3(block_threads), smem_bytes,
-           stream>>>(p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.extra_kv,
-                     p.extra_indices, p.extra_topk_length, p.extra_topk, p.extra_page_size,
-                     extra_stride, p.num_tokens, q_heads, p.topk, p.allocated_splits, cpb,
-                     p.sm_scale, main_stride, p.indices_stride_elems, p.extra_indices_stride_elems,
-                     pages);
-  result = cudaGetLastError();
+  // Bound early-resident consumers so Q producers retain resources for peer
+  // progress. Count the allocated grid, including inactive scratch splits.
+  const bool pdl = MT == ModelType::DSV4 &&
+                   size_t(p.num_tokens) * h_blocks * p.allocated_splits <= 64;
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config{dim3(p.num_tokens, h_blocks, p.allocated_splits),
+                            dim3(block_threads), size_t(smem_bytes), stream, &attr,
+                            pdl ? 1u : 0u};
+  result = cudaLaunchKernelEx(
+      &config, kernel, p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.extra_kv,
+      p.extra_indices, p.extra_topk_length, p.extra_topk, p.extra_page_size, extra_stride,
+      p.num_tokens, q_heads, p.topk, p.allocated_splits, cpb, p.sm_scale, main_stride,
+      p.indices_stride_elems, p.extra_indices_stride_elems, pages);
   if (result != cudaSuccess) return result;
   constexpr int MERGE_THREADS = MT == ModelType::DSV4 && NUM_HEADS == 8 ? 128 : 64;
   auto merge = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_THREADS,

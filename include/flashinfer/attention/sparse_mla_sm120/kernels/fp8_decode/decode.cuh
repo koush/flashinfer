@@ -411,6 +411,11 @@ __global__ void __launch_bounds__(
 
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
   // internally with count=Cfg::MATH_THREADS; rows past valid_h are zero-filled).
+  // KV/indices/lengths are independent of the preceding Q producer, so IO
+  // stages KV while math waits. Match the launcher's allocated-grid bound.
+  if constexpr (MT == ModelType::DSV4) {
+    if (size_t(gridDim.x) * gridDim.y * gridDim.z <= 64) cudaGridDependencySynchronize();
+  }
   const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
   static_assert(!COMPACT_Q || (MT == ModelType::DSV4 && NUM_HEADS == 8 && CANDIDATE_QK));
   quantize_q_to_smem<MT, Cfg::MATH_THREADS, COMPACT_Q ? 8 : HPB>(
