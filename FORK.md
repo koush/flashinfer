@@ -187,6 +187,20 @@ empty rows. Twelve further full-length cases (4/128 query rows, H8/H16) also
 passed. Six forced-prefill H8 cases under memcheck reported zero errors.
 TP1/TP2 native-wrapper tests and all 15 GLM H8 tests passed.
 
+### Prefill query staging and QK experiments
+
+DSV4 H8 BF16 prefill stages Q with uint4 vector loads/stores while retaining
+zero-initialized padded heads. Short 128-candidate prefill improved by 1–3.6%
+in alternating graph replay; dual-cache gains were small (up to 0.6%).
+FP8 staging retains its original implementation. All 12 masked benchmark
+cases and 12 full-length cases passed bitwise output/LSE and independent
+reference/graph checks. Three forced-prefill cases passed memcheck with zero errors.
+The experiment switch was removed before committing.
+
+Rejected independently: candidate-major BF16/FP8 QK using four compute warps
+and shared score redistribution was bitwise-correct but 0.4–4.1% slower.
+Compact FP8 Q staging with explicit zero padding was flat to 0.4% slower.
+
 ### Migration validation
 
 RTX PRO 6000 Blackwell, SM120:

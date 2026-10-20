@@ -262,7 +262,24 @@ __device__ __forceinline__ void prefill_mg_impl(
       const bf16* q_base_g = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
       const bf16* q_rope_base = cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
       const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
-      if constexpr (QkMode == QkComputeMode::BF16) {
+      if constexpr (MT == ModelType::DSV4 && NUM_HEADS == 8 && QkMode == QkComputeMode::BF16) {
+        for (int v = threadIdx.x; v < HPB * KV::D_NOPE / 8; v += MATH_THREADS) {
+          const int h = v / (KV::D_NOPE / 8), d = (v % (KV::D_NOPE / 8)) * 8;
+          *reinterpret_cast<uint4*>(sm.q_nope_bf16(g) + h * KV::Q_NOPE_BF16_STRIDE + d) =
+              h < 8 ? *reinterpret_cast<const uint4*>(
+                          q_base_g + h * (q_rope_base ? KV::D_NOPE : KV::D_QK) + d)
+                    : make_uint4(0, 0, 0, 0);
+        }
+        for (int v = threadIdx.x; v < HPB * KV::D_ROPE / 8; v += MATH_THREADS) {
+          const int h = v / (KV::D_ROPE / 8), d = (v % (KV::D_ROPE / 8)) * 8;
+          *reinterpret_cast<uint4*>(sm.q_rope() + h * KV::D_ROPE + d) =
+              h < 8 ? *reinterpret_cast<const uint4*>(
+                          q_rope_base ? q_rope_base + h * KV::D_ROPE + d
+                                      : q_base_g + h * KV::D_QK + KV::D_NOPE + d)
+                    : make_uint4(0, 0, 0, 0);
+        }
+        bar_sync_t<Q_STAGE_BARRIER, MATH_THREADS>();
+      } else if constexpr (QkMode == QkComputeMode::BF16) {
         load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * KV::D_ROPE,
                                               q_base_g, VALID_HPB, q_rope_base);
       } else {
