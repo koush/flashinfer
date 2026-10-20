@@ -212,6 +212,16 @@ alternating 128/512-row benchmark was latency-neutral. All 12 masked and
 checks. Three H8 forced-prefill cases passed memcheck with zero errors.
 The experimental switch is removed.
 
+### Prefill warp/tile tuning result
+
+A 32-candidate/four-math-warp variant was tested independently after the
+one-group layout change, including adjusted synchronization, IO addressing,
+and two rotary-output tiles per math warp. It exceeded the existing A/B
+output tolerance (atol 0.002, rtol 0.025): 223 of 524,288 elements failed in
+the first 128-row/128-candidate case; maximum absolute difference 0.00363159.
+It was reverted rather than relaxing the numerical budget. The accepted
+prefill path retains its 64-candidate/eight-math-warp geometry.
+
 ### Migration validation
 
 RTX PRO 6000 Blackwell, SM120:
