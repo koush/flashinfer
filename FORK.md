@@ -92,6 +92,29 @@ Rejected experiments, reverted before the four-warp trial:
   2.7–3.4% slower than the probability-pruned baseline.
 - Removing padded-head softmax shared stores/loads: bitwise-correct but
   0.3–1.0% slower than the probability-pruned baseline.
+- Two math warps with the 64-candidate tile: reference checks passed but
+  roughly 10–12% slower than the committed four-warp baseline.
+- Four warps with a 32-candidate tile and doubled chunks per split: rejected
+  after exceeding the existing A/B output tolerance (max delta 0.00268555
+  in the first 128-candidate case).
+
+### DSV4 H8 split-merge weights
+
+For H8 with at least eight allocated splits, the merge reduction warp can
+precompute each split weight in the existing shared LSE buffer. Output threads
+reuse those weights instead of redundantly evaluating exponentials. Negative
+weights mark invalid splits; valid weights that underflow to zero retain the
+original load/accumulation behavior. No additional barrier or allocation is needed.
+This is the normal H8 merge dispatch for at least eight allocated splits;
+the experimental environment override has been removed.
+
+Warm graph-replay measurements show approximately 7.1–7.4% lower total
+decode-plus-merge latency for 512 and 128+512 candidates (1/4/8/16 query rows).
+The two-split 128-candidate case retains the original merge; H16 is unchanged.
+All 24 benchmark cases have bitwise-identical output/LSE, pass independent FP32
+reference checks and eager/graph checks. Six additional H8 cases with 64 allocated
+splits (including inactive splits) pass the same checks and Compute Sanitizer
+memcheck with zero errors. TP1/TP2 native-wrapper tests pass.
 
 ## Validation
 

@@ -7,7 +7,8 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
+template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD,
+          bool PRECOMPUTE_WEIGHTS = false>
 static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
     sparse_mla_decode_dsv4_merge_kernel(const bf16* __restrict__ mid_out,
                                         const float* __restrict__ mid_lse,
@@ -72,6 +73,14 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
       sm_inv_gsum = (total_sum > 0.f) ? (1.f / total_sum) : 0.f;
       sm_glse = (total_sum > 0.f) ? (log2f(total_sum) + gmax) : -INFINITY;
     }
+    if constexpr (PRECOMPUTE_WEIGHTS) {
+      // The reduction warp has consumed every LSE. Reuse the same shared
+      // buffer for split weights before the existing publication barrier.
+      for (int sp = tid; sp < num_splits; sp += 32) {
+        const float lse_sp = sm_lse[sp];
+        sm_lse[sp] = lse_sp > -1e29f ? exp2f(lse_sp - gmax) : -1.f;
+      }
+    }
   }
   __syncthreads();
   const float global_max = sm_gmax;
@@ -87,8 +96,8 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
 
   for (int sp = 0; sp < num_splits; sp++) {
     float lse_sp = sm_lse[sp];
-    if (lse_sp <= -1e29f) continue;
-    const float weight = exp2f(lse_sp - global_max);
+    if (PRECOMPUTE_WEIGHTS ? lse_sp < 0.f : lse_sp <= -1e29f) continue;
+    const float weight = PRECOMPUTE_WEIGHTS ? lse_sp : exp2f(lse_sp - global_max);
     const bf16* row_base = mid_base + (size_t)sp * D_V_VAL + dim_base;
 #pragma unroll
     for (int v = 0; v < VECS_PER_THREAD; v++) {
