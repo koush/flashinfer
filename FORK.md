@@ -201,6 +201,17 @@ Rejected independently: candidate-major BF16/FP8 QK using four compute warps
 and shared score redistribution was bitwise-correct but 0.4–4.1% slower.
 Compact FP8 Q staging with explicit zero padding was flat to 0.4% slower.
 
+### One-group DSV4 H8 prefill shared layout
+
+DSV4 H8 MG prefill reserves one head group's Q, reductions, normalization,
+and probability buffers rather than two. Launch/resource planning uses the
+same layout. Shared memory falls from 97,936 to 79,696 bytes for BF16 QK
+and 84,496 to 72,976 bytes for FP8 QK. This is a resource reduction; the
+alternating 128/512-row benchmark was latency-neutral. All 12 masked and
+12 full-length cases passed bitwise output/LSE, FP32 reference and graph
+checks. Three H8 forced-prefill cases passed memcheck with zero errors.
+The experimental switch is removed.
+
 ### Migration validation
 
 RTX PRO 6000 Blackwell, SM120:

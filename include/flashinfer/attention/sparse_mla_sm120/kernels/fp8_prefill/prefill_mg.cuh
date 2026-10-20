@@ -36,9 +36,8 @@ using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
 //             upper 8 rows and gates all global reads/writes.
 // ============================================================================
 
-// SmemLayoutMG / SmemPtrsMG are parameterised on the default MG_N_HG=2 layout;
-// MG_N_HG_T=1 instantiations reuse them and waste ~half the MG smem to avoid a
-// full retemplate (q_nope/q_sc/m_smem/l_smem/reduce_buf/w_smem).
+// DSV4 H8 uses a one-group shared layout; other routes retain the default
+// two-group layout. The launch and resource planner use the same geometry.
 static constexpr int MG_N_HG_DEFAULT = SmemLayoutMG<ModelType::DSV4, QkComputeMode::FP8>::N_HG;
 static constexpr int MG_HEADS_PER_CTA_DEFAULT = MG_N_HG_DEFAULT * HPB;  // 32
 
@@ -74,7 +73,9 @@ __device__ __forceinline__ void prefill_mg_impl(
   constexpr bool REUSE_ADDRESS = MT == ModelType::DSV4;
   // CT pinned to FP8: XV always uses FP8 W; QkMode only flips the QK side.
   using CT = ComputeTraits<MT, QkComputeMode::FP8, BI, N_MATH_WARPS>;
-  using SMG = SmemPtrsMG<MT, QkMode>;
+  static constexpr int LAYOUT_GROUPS = MT == ModelType::DSV4 && NUM_HEADS == 8 ? 1 : 2;
+  using SMG = SmemPtrsMG<MT, QkMode, BI, N_MATH_WARPS, LAYOUT_GROUPS>;
+  using LMG = SmemLayoutMG<MT, QkMode, BI, N_MATH_WARPS, LAYOUT_GROUPS>;
   using AddressReady =
       flashinfer::sparse_mla_sm120::pipeline::StoreHandoff<6, 7, IO_THREADS, MATH_THREADS>;
 
@@ -197,7 +198,7 @@ __device__ __forceinline__ void prefill_mg_impl(
         if (io_tid == 0) BulkReady::expect(sm.mbar_kv(buf), BI * KV::KV_SMEM_COPY_BYTES);
         if (io_tid < BI) {
           auto addresses = reinterpret_cast<const uint8_t**>(
-              smem_raw + SmemLayoutMG<MT, QkMode>::OFF_KV_ADDRESS);
+              smem_raw + LMG::OFF_KV_ADDRESS);
           addresses[buf * BI + io_tid] = address;
           cp_async_bulk_g2s_l2hint(sm.kv_buf(buf) + io_tid * KV::KV_SMEM_STRIDE, address,
                                    KV::KV_SMEM_COPY_BYTES, sm.mbar_kv(buf), kv_l2_policy);
@@ -345,7 +346,7 @@ __device__ __forceinline__ void prefill_mg_impl(
       if constexpr (REUSE_ADDRESS) {
         AddressReady::wait(ti & 1);
         auto addresses = reinterpret_cast<const uint8_t* const*>(
-            smem_raw + SmemLayoutMG<MT, QkMode>::OFF_KV_ADDRESS);
+            smem_raw + LMG::OFF_KV_ADDRESS);
         entry_base_gid = addresses[(ti & 1) * BI + qk_nb + gid];
       } else {
         // Position and runtime length are cache-section-relative under dual cache.
@@ -732,7 +733,7 @@ __device__ __forceinline__ void prefill_mg_impl(
       if constexpr (KV::V_HAS_ROPE) {
         bar_sync_t<Fp8PrefillSync::MATH, MATH_THREADS>();
         auto addresses = reinterpret_cast<const uint8_t* const*>(
-            smem_raw + SmemLayoutMG<MT, QkMode>::OFF_KV_ADDRESS);
+            smem_raw + LMG::OFF_KV_ADDRESS);
         const int valid_len = (DUAL_CACHE && !is_main)
                                   ? min(BI, topk_len_extra - (ti - main_ni) * BI)
                                   : min(BI, topk_len - ti * BI);

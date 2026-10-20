@@ -116,11 +116,12 @@ struct SmemLayout {
 };
 
 // MG (multi-group) layout: 2 head groups, shared reduce/sum_reduce buffer.
-template <ModelType MT, QkComputeMode QkMode, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
+template <ModelType MT, QkComputeMode QkMode, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS, int HEAD_GROUPS = 2>
 struct SmemLayoutMG {
   using KV = KVCacheTraits<MT>;
   using CT = ComputeTraits<MT, QkMode, TILE_BI, TILE_MATH_WARPS>;
-  static constexpr int N_HG = 2;
+  static constexpr int N_HG = HEAD_GROUPS;
+  static_assert(N_HG == 1 || N_HG == 2);
 
   static constexpr bool BF16_Q = (QkMode == QkComputeMode::BF16);
   static constexpr size_t SMEM_Q_NOPE =
@@ -148,9 +149,9 @@ struct SmemLayoutMG {
 
   static constexpr size_t OFF_Q_NOPE0 = 0;
   static constexpr size_t OFF_Q_NOPE1 = OFF_Q_NOPE0 + SMEM_Q_NOPE;
-  static constexpr size_t OFF_Q_SC0 = OFF_Q_NOPE1 + SMEM_Q_NOPE;
+  static constexpr size_t OFF_Q_SC0 = OFF_Q_NOPE0 + N_HG * SMEM_Q_NOPE;
   static constexpr size_t OFF_Q_SC1 = OFF_Q_SC0 + SMEM_Q_SC;
-  static constexpr size_t OFF_KV0 = OFF_Q_SC1 + SMEM_Q_SC;
+  static constexpr size_t OFF_KV0 = OFF_Q_SC0 + N_HG * SMEM_Q_SC;
   static constexpr size_t OFF_KV1 = OFF_KV0 + SMEM_KV_BUF;
   static constexpr size_t OFF_KV_SC0 = OFF_KV1 + SMEM_KV_BUF;
   static constexpr size_t OFF_KV_SC1 = OFF_KV_SC0 + SMEM_KV_SCALE_BUF;
@@ -171,9 +172,9 @@ struct SmemLayoutMG {
 };
 
 // MG convenience accessor
-template <ModelType MT, QkComputeMode QkMode, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
+template <ModelType MT, QkComputeMode QkMode, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS, int HEAD_GROUPS = 2>
 struct SmemPtrsMG {
-  using LMG = SmemLayoutMG<MT, QkMode, TILE_BI, TILE_MATH_WARPS>;
+  using LMG = SmemLayoutMG<MT, QkMode, TILE_BI, TILE_MATH_WARPS, HEAD_GROUPS>;
   using CT = ComputeTraits<MT, QkMode, TILE_BI, TILE_MATH_WARPS>;
 
   static constexpr int N_HG = LMG::N_HG;

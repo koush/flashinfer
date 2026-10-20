@@ -81,6 +81,11 @@ void prefill_resources(ExecutionPlan& p) {
     p.shared_bytes = p.numeric == NumericRoute::QkBF16PvFP8
                          ? SmemLayoutMG<MT, QkComputeMode::BF16>::TOTAL
                          : SmemLayoutMG<MT, QkComputeMode::FP8>::TOTAL;
+    if (p.metadata.heads == 8) {
+      p.shared_bytes = p.numeric == NumericRoute::QkBF16PvFP8
+          ? SmemLayoutMG<MT, QkComputeMode::BF16, BI, N_MATH_WARPS, 1>::TOTAL
+          : SmemLayoutMG<MT, QkComputeMode::FP8, BI, N_MATH_WARPS, 1>::TOTAL;
+    }
   } else {
     using Resources = Fp8PrefillResources<MT, QkComputeMode::FP8, void>;
     p.block_threads = Resources::BLOCK_THREADS;

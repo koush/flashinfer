@@ -162,7 +162,8 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
                                       const int32_t* indices, const float* attn_sink, bf16* output,
                                       float* out_lse, cudaStream_t stream,
                                       const PrefillColdParams& cold) {
-  constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode>::TOTAL;
+  constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode, BI, N_MATH_WARPS,
+      MT == ModelType::DSV4 && NUM_HEADS == 8 ? 1 : 2>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
@@ -188,7 +189,8 @@ PrefillLaunchResult launch_prefill_mg_dual_fulltile(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, const uint8_t* KV_cache_extra,
     const int32_t* indices_extra, const float* attn_sink, bf16* output, float* out_lse,
     cudaStream_t stream, const PrefillColdParams& cold) {
-  constexpr size_t smem_bytes = SmemLayoutMG<MT, QkComputeMode::BF16>::TOTAL;
+  constexpr size_t smem_bytes = SmemLayoutMG<MT, QkComputeMode::BF16, BI, N_MATH_WARPS,
+      MT == ModelType::DSV4 && NUM_HEADS == 8 ? 1 : 2>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
@@ -222,7 +224,8 @@ PrefillLaunchResult launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cach
                                            const int32_t* indices_extra, const float* attn_sink,
                                            bf16* output, float* out_lse, cudaStream_t stream,
                                            const PrefillColdParams& cold) {
-  constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode>::TOTAL;
+  constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode, BI, N_MATH_WARPS,
+      MT == ModelType::DSV4 && NUM_HEADS == 8 ? 1 : 2>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
