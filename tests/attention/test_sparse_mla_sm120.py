@@ -1081,7 +1081,7 @@ def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
     torch.testing.assert_close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
-_DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
+_DSV3_2_DECODE_HEADS = [1, 4, 8, 16, 32, 64, 128]
 # Runtime-H decode-dsv3_2: arbitrary head counts (remainder-block pad path).
 _DSV3_2_DECODE_RUNTIME_HEADS = [12, 24]
 
@@ -1310,7 +1310,7 @@ def test_sparse_mla_sm120_v32_prefill_public_api_accepts_hnd_view() -> None:
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
-_DSV3_2_PREFILL_HEADS = [8, 16, 32, 64, 128]
+_DSV3_2_PREFILL_HEADS = [1, 4, 8, 16, 32, 64, 128]
 
 
 @pytest.mark.parametrize("num_heads", _DSV3_2_PREFILL_HEADS)
