@@ -173,6 +173,20 @@ Six H8 cases with 64 scratch splits passed memcheck with zero errors.
 The preceding two-chunks-per-block experiment passed tolerance/reference
 checks but was 30–36% slower and was reverted.
 
+### DSV4 H8 prefill probability pruning
+
+MG prefill zeros probabilities for padded H8 head rows and
+skips their V-scale maximum atomics, for both single and dual caches.
+This is the normal DSV4 H8 prefill path; the experimental override is removed.
+
+Alternating warm graph replay measured 1.7–2.8% lower H8 prefill latency for
+128/512 query rows and 128/512/128+512 candidates. H16 controls were flat.
+All 12 benchmark cases had bitwise-identical output/LSE and passed independent
+FP32 reference and eager/graph checks, with sinks, holes, partial lengths and
+empty rows. Twelve further full-length cases (4/128 query rows, H8/H16) also
+passed. Six forced-prefill H8 cases under memcheck reported zero errors.
+TP1/TP2 native-wrapper tests and all 15 GLM H8 tests passed.
+
 ### Migration validation
 
 RTX PRO 6000 Blackwell, SM120:

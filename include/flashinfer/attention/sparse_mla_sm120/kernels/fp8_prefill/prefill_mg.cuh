@@ -531,8 +531,9 @@ __device__ __forceinline__ void prefill_mg_impl(
 
         float w0 = valid0 ? exp2f(scores_log2[g][0] - nm0) : 0.f;
         float w1 = valid1 ? exp2f(scores_log2[g][1] - nm0) : 0.f;
-        float w2 = valid0 ? exp2f(scores_log2[g][2] - nm1) : 0.f;
-        float w3 = valid1 ? exp2f(scores_log2[g][3] - nm1) : 0.f;
+        constexpr bool PADDED_H8 = MT == ModelType::DSV4 && NUM_HEADS == 8;
+        float w2 = !PADDED_H8 && valid0 ? exp2f(scores_log2[g][2] - nm1) : 0.f;
+        float w3 = !PADDED_H8 && valid1 ? exp2f(scores_log2[g][3] - nm1) : 0.f;
         p[g][0] = w0;
         p[g][1] = w1;
         p[g][2] = w2;
@@ -552,7 +553,7 @@ __device__ __forceinline__ void prefill_mg_impl(
           atomicMax(
               reinterpret_cast<int*>(&sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid]),
               __float_as_int(fmaxf(ws00, ws01)));
-          atomicMax(reinterpret_cast<int*>(
+          if constexpr (!PADDED_H8) atomicMax(reinterpret_cast<int*>(
                         &sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid + 8]),
                     __float_as_int(fmaxf(ws10, ws11)));
         }
