@@ -47,7 +47,7 @@ namespace flashinfer::sparse_mla_sm120 {
 // and an unconstrained register budget avoids the spill forced by that hint.
 // The mixed schedule supplies its own launch bound.
 template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule,
-          int MATH_WARPS = 0>
+          int MATH_WARPS = 0, bool CANDIDATE_QK = false>
 __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE, MATH_WARPS>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
@@ -460,6 +460,14 @@ __global__ void __launch_bounds__(
 
     // ── Stage 2 QK ────────────────────────────────────────────
     float qk[Cfg::QK_N_TILES][4] = {0};
+    if constexpr (CANDIDATE_QK) {
+      static_assert(MT == ModelType::DSV4 && NUM_HEADS == 8 && Cfg::QK_N_TILES == 2);
+      const int first = warp_id * Cfg::ENTRIES_PER_WARP;
+      dsv4_h8_candidate_qk(qk, sm.q_fp8(), sm.q_sc(), sm.q_rope(),
+                           sm_kv_fp8 + first * KV_SMEM_STRIDE,
+                           sm_kv_sc + first * SCALE_STRIDE,
+                           sm_kv_rope + first * D_ROPE_C, lane);
+    } else {
 #pragma unroll
     for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       const int first = warp_id * Cfg::ENTRIES_PER_WARP + nt * 8;
@@ -494,6 +502,7 @@ __global__ void __launch_bounds__(
       }
     }
 
+    }
     // Mask invalid cands + sm_scale × LOG2E. Invalid = position past
     // section_len OR slot id = -1 (indexer-padded). Invalid candidates gather
     // a zero row and receive the finite -1e30 mask.

@@ -118,6 +118,25 @@ memcheck with zero errors. TP1/TP2 native-wrapper tests pass.
 
 ## Validation
 
+### Candidate-major DSV4 H8 QK
+
+The H8 decode QK path computes a 16-candidate by 8-head MMA
+tile instead of two padded 16-head by 8-candidate tiles. It swaps Q/K data
+and UE8M0 scale operands, includes rotary QK, then uses warp shuffles to
+restore the existing head-major softmax/PV register layout.
+This is the normal DSV4 H8 decode path; the experimental environment override
+has been removed.
+
+An uncontended alternating graph-replay sweep measured 1.8–2.4% lower
+H8 decode-plus-merge latency for 1/4/8/16 rows and 128/512/128+512 candidates.
+H16 controls were unchanged. All 24 cases had bitwise-identical output/LSE
+and passed independent FP32 attention and eager/graph checks. TP1/TP2 native
+wrapper tests passed. Six further H8 cases with 64 allocated splits passed
+Compute Sanitizer memcheck with zero errors. An earlier timing sweep was
+discarded because another workload was active on the GPUs.
+
+### Migration validation
+
 RTX PRO 6000 Blackwell, SM120:
 
 - Parent `npm run build:all` passes (CUDA, addon, TypeScript).

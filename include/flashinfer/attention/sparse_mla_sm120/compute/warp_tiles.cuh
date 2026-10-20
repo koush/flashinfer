@@ -14,6 +14,53 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
+// Candidate-major 16x8 QK for DSV4 TP8. Transpose the accumulator registers
+// back to two head-major 8-candidate tiles for the existing softmax/PV path.
+__device__ __forceinline__ void dsv4_h8_candidate_qk(
+    float (&qk)[2][4], const uint8_t* q, const float* qs, const bf16* qr,
+    const uint8_t* k, const uint8_t* scales, const bf16* kr, int lane) {
+  using KV = KVCacheTraits<ModelType::DSV4>;
+  const int gid = lane >> 2, tid = lane & 3;
+  float score[4] = {};
+#pragma unroll
+  for (int blk = 0; blk < KV::NUM_SCALES; ++blk) {
+    const uint8_t sfa = scales[(gid + (lane & 1) * 8) * KV::SCALE_BYTES_PER_TOKEN + blk];
+    const uint8_t sfb = fp32_exponent_byte(qs[gid * KV::NUM_SCALES + blk]);
+#pragma unroll
+    for (int ks = 0; ks < KV::QUANT_TILE / 32; ++ks) {
+      const int offset = blk * KV::QUANT_TILE + ks * 32;
+      uint32_t a0, a1, a2, a3, b0, b1;
+      ldmatrix_load_a_packed_16x32_bytes(a0, a1, a2, a3, k + offset, KV::KV_SMEM_STRIDE, lane);
+      ldmatrix_load_b_packed_8x32_bytes(b0, b1, q + offset, KV::Q_NOPE_STRIDE, lane);
+      auto r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1,
+                                            score[0], score[1], score[2], score[3], sfa, sfb);
+      score[0] = r.d0; score[1] = r.d1; score[2] = r.d2; score[3] = r.d3;
+    }
+  }
+#pragma unroll
+  for (int ks = 0; ks < KV::D_ROPE / 16; ++ks) {
+    uint32_t a0, a1, a2, a3;
+    ldmatrix_load_A_bf16(a0, a1, a2, a3, kr + ks * 16, KV::D_ROPE, lane);
+    const bf16* row = qr + gid * KV::D_ROPE + ks * 16 + tid * 2;
+    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(row);
+    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(row + 8);
+    auto r = mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1,
+                               score[0], score[1], score[2], score[3]);
+    score[0] = r.d0; score[1] = r.d1; score[2] = r.d2; score[3] = r.d3;
+  }
+#pragma unroll
+  for (int tile = 0; tile < 2; ++tile) {
+#pragma unroll
+    for (int column = 0; column < 2; ++column) {
+      const int source = (tid * 2 + column) * 4 + gid / 2;
+      const float even = __shfl_sync(0xffffffff, score[tile * 2], source);
+      const float odd = __shfl_sync(0xffffffff, score[tile * 2 + 1], source);
+      qk[tile][column] = (gid & 1) ? odd : even;
+    }
+    qk[tile][2] = qk[tile][3] = 0.f;
+  }
+}
+
 template <typename KV>
 __device__ __forceinline__ void qk_fp8_nope_16x8(float qk[4], const uint8_t* q, const float* q_sc,
                                                  const uint8_t* k, const uint8_t* k_sc, int lane) {
