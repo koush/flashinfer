@@ -135,6 +135,26 @@ wrapper tests passed. Six further H8 cases with 64 allocated splits passed
 Compute Sanitizer memcheck with zero errors. An earlier timing sweep was
 discarded because another workload was active on the GPUs.
 
+### 128-thread DSV4 H8 merge
+
+The H8 merge uses 128 threads and four BF16 output dimensions
+per thread (uint2 loads/stores), compared with 64 threads and eight dimensions
+(uint4). This is the normal DSV4 H8 dispatch; the experimental environment
+override has been removed.
+
+Alternating warm graph replay measured 0.6–1.4% lower total decode-plus-merge
+latency across the 12 H8 cases; H16 controls were flat. All 24 cases passed
+bitwise output/LSE comparisons, independent FP32 reference and eager/graph
+checks. Six additional cases with 64 allocated splits passed those checks
+and Compute Sanitizer memcheck with zero errors. TP1/TP2 wrapper tests passed.
+
+Rejected and reverted during this round (all bitwise-correct):
+- H8 value-major PV with a register transpose each step: 2.6–3.2% slower.
+- H8 value-major PV retaining transposed accumulators through scalar output
+  stores: 2.7–7.8% slower.
+- 32-thread merge: about 1% slower for two splits and 10–11% slower for
+  eight/ten splits.
+
 ### Migration validation
 
 RTX PRO 6000 Blackwell, SM120:

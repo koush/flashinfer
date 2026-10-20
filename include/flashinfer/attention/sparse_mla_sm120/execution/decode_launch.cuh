@@ -63,7 +63,7 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
                      pages);
   result = cudaGetLastError();
   if (result != cudaSuccess) return result;
-  constexpr int MERGE_THREADS = 64;
+  constexpr int MERGE_THREADS = MT == ModelType::DSV4 && NUM_HEADS == 8 ? 128 : 64;
   auto merge = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_THREADS,
                                                     KV::D_V / MERGE_THREADS>;
   if constexpr (MT == ModelType::DSV4 && NUM_HEADS == 8) {

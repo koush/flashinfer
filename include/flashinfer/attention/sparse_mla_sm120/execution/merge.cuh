@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include <type_traits>
+
 #include "../arch/common.cuh"
 #include "../common/lse.cuh"
 
@@ -17,9 +19,11 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
                                         int num_splits, int num_heads, int mid_heads,
                                         size_t stride_out_lse, float lse_scale) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
-  static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
+  static_assert(DIMS_PER_THREAD % 4 == 0, "DIMS_PER_THREAD must be multiple of 4");
   static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
-  constexpr int VECS_PER_THREAD = DIMS_PER_THREAD / 8;
+  constexpr int VEC_DIMS = DIMS_PER_THREAD < 8 ? 4 : 8;
+  constexpr int VECS_PER_THREAD = DIMS_PER_THREAD / VEC_DIMS;
+  using Packed = std::conditional_t<VEC_DIMS == 8, uint4, uint2>;
   const int q_heads = (NUM_HEADS == 0) ? num_heads : NUM_HEADS;
   const int m_heads = (NUM_HEADS == 0) ? mid_heads : NUM_HEADS;
 
@@ -101,27 +105,27 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
     const bf16* row_base = mid_base + (size_t)sp * D_V_VAL + dim_base;
 #pragma unroll
     for (int v = 0; v < VECS_PER_THREAD; v++) {
-      const uint4 packed = *reinterpret_cast<const uint4*>(row_base + v * 8);
+      const Packed packed = *reinterpret_cast<const Packed*>(row_base + v * VEC_DIMS);
       const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
 #pragma unroll
-      for (int p = 0; p < 4; p++) {
+      for (int p = 0; p < VEC_DIMS / 2; p++) {
         const float2 f = __bfloat1622float2(pairs[p]);
-        acc[v * 8 + p * 2 + 0] += weight * f.x;
-        acc[v * 8 + p * 2 + 1] += weight * f.y;
+        acc[v * VEC_DIMS + p * 2 + 0] += weight * f.x;
+        acc[v * VEC_DIMS + p * 2 + 1] += weight * f.y;
       }
     }
   }
 
 #pragma unroll
   for (int v = 0; v < VECS_PER_THREAD; v++) {
-    uint4 packed;
+    Packed packed;
     __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
 #pragma unroll
-    for (int p = 0; p < 4; p++) {
-      pairs[p] = __floats2bfloat162_rn(acc[v * 8 + p * 2 + 0] * inv_global_sum,
-                                       acc[v * 8 + p * 2 + 1] * inv_global_sum);
+    for (int p = 0; p < VEC_DIMS / 2; p++) {
+      pairs[p] = __floats2bfloat162_rn(acc[v * VEC_DIMS + p * 2 + 0] * inv_global_sum,
+                                        acc[v * VEC_DIMS + p * 2 + 1] * inv_global_sum);
     }
-    *reinterpret_cast<uint4*>(out_ptr + dim_base + v * 8) = packed;
+    *reinterpret_cast<Packed*>(out_ptr + dim_base + v * VEC_DIMS) = packed;
   }
   if (out_lse != nullptr && tid == 0) {
     out_lse[(size_t)t_idx * stride_out_lse + h] = scale_output_lse(sm_glse, lse_scale);
