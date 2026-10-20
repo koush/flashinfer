@@ -47,7 +47,7 @@ namespace flashinfer::sparse_mla_sm120 {
 // and an unconstrained register budget avoids the spill forced by that hint.
 // The mixed schedule supplies its own launch bound.
 template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule,
-          int MATH_WARPS = 0, bool CANDIDATE_QK = false>
+          int MATH_WARPS = 0, bool CANDIDATE_QK = false, bool COMPACT_Q = false>
 __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE, MATH_WARPS>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
@@ -412,7 +412,9 @@ __global__ void __launch_bounds__(
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
   // internally with count=Cfg::MATH_THREADS; rows past valid_h are zero-filled).
   const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
+  static_assert(!COMPACT_Q || (MT == ModelType::DSV4 && NUM_HEADS == 8 && CANDIDATE_QK));
+  quantize_q_to_smem<MT, Cfg::MATH_THREADS, COMPACT_Q ? 8 : HPB>(
+      sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[ACC_V_STEPS][NT_PER_WARP_XV][4] = {0};

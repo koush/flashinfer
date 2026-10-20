@@ -172,7 +172,7 @@ __device__ __forceinline__ QSwapABRegs<MT> quantize_q_to_regs_swapab(
 // Called by the math threads only; the trailing bar:2 syncs the math group.
 // q_base must be 16B-aligned row-wise: every row offset is a multiple of
 // D_QK * 2 bytes, and D_QK * 2 % 16 == 0 for every supported model type.
-template <ModelType MT, int _MATH_THREADS>
+template <ModelType MT, int _MATH_THREADS, int STAGED_HEADS = HPB>
 __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q_nope_sc,
                                                    bf16* q_rope, const bf16* q_base,
                                                    int valid_hpb = HPB,
@@ -192,7 +192,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   // (only valid heads from gmem; zero-fill rest).
   if constexpr (D_ROPE > 0) {
     constexpr int ROPE_VECS_PER_HEAD = D_ROPE / 8;
-    for (int v = tid; v < HPB * ROPE_VECS_PER_HEAD; v += _MATH_THREADS) {
+    for (int v = tid; v < STAGED_HEADS * ROPE_VECS_PER_HEAD; v += _MATH_THREADS) {
       const int h = v / ROPE_VECS_PER_HEAD, r = v % ROPE_VECS_PER_HEAD;
       uint4 val = make_uint4(0, 0, 0, 0);
       if (h < valid_hpb)
@@ -205,13 +205,13 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   // Supplied FP8 values and scales are already quantized; preserve them exactly.
   if (scales) {
     const uint8_t* values = reinterpret_cast<const uint8_t*>(q_base);
-    for (int i = tid; i < HPB * D_NOPE / 16; i += _MATH_THREADS) {
+    for (int i = tid; i < STAGED_HEADS * D_NOPE / 16; i += _MATH_THREADS) {
       const int h = i / (D_NOPE / 16), d = (i % (D_NOPE / 16)) * 16;
       *reinterpret_cast<uint4*>(q_nope_fp8 + h * Q_NOPE_STRIDE + d) =
           h < valid_hpb ? *reinterpret_cast<const uint4*>(values + h * D_NOPE + d)
                         : make_uint4(0, 0, 0, 0);
     }
-    for (int i = tid; i < HPB * NUM_SCALES; i += _MATH_THREADS)
+    for (int i = tid; i < STAGED_HEADS * NUM_SCALES; i += _MATH_THREADS)
       q_nope_sc[i] = i < valid_hpb * NUM_SCALES ? scales[i] : 1.f;
     bar_sync_t<Q_STAGE_BARRIER, _MATH_THREADS>();
     return;
@@ -225,7 +225,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   // LANES_PER_TILE lanes covers exactly one tile and the tile absmax is a
   // warp-local shuffle reduce — no smem amax scratch, no atomicMax.
   constexpr int VECS_PER_HEAD = D_NOPE / 8;  // uint4 vectors per head row
-  constexpr int TOTAL_VECS = HPB * VECS_PER_HEAD;
+  constexpr int TOTAL_VECS = STAGED_HEADS * VECS_PER_HEAD;
   constexpr int LANES_PER_TILE = QUANT_TILE / 8;  // vectors (and lanes) per tile
   constexpr int MAX_VECS = (TOTAL_VECS + _MATH_THREADS - 1) / _MATH_THREADS;
   static_assert(32 % LANES_PER_TILE == 0, "a tile must not straddle a warp");

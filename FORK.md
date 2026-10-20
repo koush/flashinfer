@@ -155,6 +155,24 @@ Rejected and reverted during this round (all bitwise-correct):
 - 32-thread merge: about 1% slower for two splits and 10–11% slower for
   eight/ten splits.
 
+### Compact DSV4 H8 query staging
+
+Candidate-major H8 QK only reads eight query heads. The compact staging
+path quantizes/copies those eight heads without initializing the padded
+eight heads. Shared layout and synchronization are unchanged. A compile-time
+guard requires DSV4 H8 with candidate-major QK; other callers retain full staging.
+This is the normal DSV4 H8 query staging path; the experimental environment
+override has been removed.
+
+Two alternating warm replay sweeps found a small repeatable gain: about
+0.35–0.55% in most H8 cases, with the one-query/128-candidate case near 0.1%.
+H16 controls were flat. All 24 cases passed bitwise output/LSE, FP32 reference,
+and eager/graph comparisons. TP1/TP2 wrapper tests and all 15 GLM H8 tests pass.
+Six H8 cases with 64 scratch splits passed memcheck with zero errors.
+
+The preceding two-chunks-per-block experiment passed tolerance/reference
+checks but was 30–36% slower and was reverted.
+
 ### Migration validation
 
 RTX PRO 6000 Blackwell, SM120:

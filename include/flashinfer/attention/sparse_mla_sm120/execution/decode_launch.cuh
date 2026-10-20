@@ -22,7 +22,7 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   const int block_threads = plan.block_threads;
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
   if constexpr (MT == ModelType::DSV4 && NUM_HEADS == 8) {
-    kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, 4, true>;
+    kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, 4, true, true>;
   }
   // Inline-scale rows are addressed flat: the stride arguments carry the main
   // and extra row pitches.
