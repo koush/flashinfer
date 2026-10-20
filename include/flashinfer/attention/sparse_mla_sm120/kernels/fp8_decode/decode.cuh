@@ -46,7 +46,8 @@ namespace flashinfer::sparse_mla_sm120 {
 // The ordinary schedule omits minBlocksPerSM: it is smem-bound at 1 block/SM,
 // and an unconstrained register budget avoids the spill forced by that hint.
 // The mixed schedule supplies its own launch bound.
-template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule>
+template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule,
+          bool PRUNE_H8 = true>
 __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
@@ -629,8 +630,13 @@ __global__ void __launch_bounds__(
     for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       w_pre[nt][0] = p[nt][0] * warp_rescale0;
       w_pre[nt][1] = p[nt][1] * warp_rescale0;
-      w_pre[nt][2] = p[nt][2] * warp_rescale1;
-      w_pre[nt][3] = p[nt][3] * warp_rescale1;
+      if constexpr (PRUNE_H8 && MT == ModelType::DSV4 && NUM_HEADS == 8) {
+        w_pre[nt][2] = 0.f;
+        w_pre[nt][3] = 0.f;
+      } else {
+        w_pre[nt][2] = p[nt][2] * warp_rescale1;
+        w_pre[nt][3] = p[nt][3] * warp_rescale1;
+      }
     }
     if constexpr (V_ROPE) {
       const int cand_col_base = warp_id * Cfg::ENTRIES_PER_WARP;
@@ -664,8 +670,12 @@ __global__ void __launch_bounds__(
           const float vsc1 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_STRIDE + vc]);
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid]),
                     __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
-          atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
+          // DSV4 TP8 has only the lower eight head rows. The upper MMA
+          // rows are discarded, so they need no probability-scale reduction.
+          if constexpr (!PRUNE_H8 || MT != ModelType::DSV4 || NUM_HEADS != 8) {
+            atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
+                      __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
+          }
         }
       }
     }

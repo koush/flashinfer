@@ -58,6 +58,23 @@ Recreate captured graphs after changing either variable.
 H8 ports preserve upstream's zero-row handling for masked cache reads, including
 stale indices beyond the per-row length, and upstream's named pipeline barriers.
 
+### DSV4 eight-head decode
+
+The DSV4 H8 decode specialization zeros discarded probability rows before
+quantization and omits their probability-scale atomics. This covers the parent
+DeepSeek V4.1 TP8 single-/dual-cache decode path, which uses `ModelType::DSV4`.
+`FLASHINFER_DSV4_H8_PRUNE=0` restores the original kernel for A/B measurements;
+pruning is enabled by default. Recreate CUDA graphs (or restart the executor)
+after changing this variable.
+
+Alternating same-process graph-replay microbenchmarks measured a 1.0–1.6%
+decode-plus-merge latency reduction for H8, 1/4/8/16 query rows, and 128, 512,
+or 128+512 candidates. H16 controls were unchanged. These are warm-replay
+measurements, not cold-cache or full-model throughput results. All 24 H8/H16
+cases had bitwise-identical output/LSE, including sinks, invalid indices,
+partial lengths and empty rows; Compute Sanitizer memcheck reported zero
+errors. The parent's TP1/TP2 native-wrapper reference tests also pass.
+
 ## Validation
 
 RTX PRO 6000 Blackwell, SM120:
