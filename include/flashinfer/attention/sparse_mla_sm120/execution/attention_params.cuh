@@ -28,6 +28,8 @@ struct PrefillColdParams {
   flashinfer::uint_fastdiv main_div;
   flashinfer::uint_fastdiv extra_div;
   float lse_scale = 1.f;
+  const bf16* q_rope_split = nullptr;
+  const float* q_scales = nullptr;
 };
 
 struct Dsv4PageDivisors {
@@ -97,6 +99,9 @@ struct AttentionParams {
   float lse_scale = 1.f;
   size_t row_stride_bytes = 0;        // Inline-scale main row pitch; footer rows are packed.
   size_t extra_row_stride_bytes = 0;  // Inline-scale extra row pitch.
+  // GLM split queries: dense BF16/FP8 NoPE, BF16 RoPE, optional FP32 scales.
+  const bf16* q_rope_split = nullptr;
+  const float* q_scales = nullptr;
 };
 
 }  // namespace flashinfer::sparse_mla_sm120::execution

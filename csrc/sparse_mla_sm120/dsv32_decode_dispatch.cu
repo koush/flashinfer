@@ -13,12 +13,13 @@
 // instantiation serves every indices-row width.
 
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 #include <flashinfer/attention/sparse_mla_sm120/execution/merge.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv32_fp8/decode.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/kernels/dsv32_fp8/decode_glm_h8.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
 
-#include "../tvm_ffi_utils.h"
 #include "attention_dispatch.h"
 
 namespace flashinfer::sparse_mla_sm120 {
@@ -26,16 +27,17 @@ namespace flashinfer::sparse_mla_sm120 {
 #define DSV32_CUDA_CHECK(call)                                                              \
   do {                                                                                      \
     cudaError_t e = (call);                                                                 \
-    TVM_FFI_ICHECK_EQ(e, cudaSuccess) << "sparse-MLA " #call ": " << cudaGetErrorString(e); \
+    if (e != cudaSuccess) return e; \
   } while (0)
 
 template <ModelType MT, int NUM_HEADS>
-static bool launch_decode_dsv3_2_impl(
+static cudaError_t launch_decode_dsv3_2_impl(
     int num_heads, int topk, const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     bf16* mid_out, float* mid_lse, const int* topk_length, bf16* output, float* out_lse,
     const float* attn_sink, int num_tokens, int num_splits, int chunks_per_block_override,
     float sm_scale, size_t stride_kv_block, size_t stride_indices_token, int stride_kv_row,
-    size_t stride_out_lse, int page_size, cudaStream_t stream, float lse_scale) {
+    size_t stride_out_lse, int page_size, cudaStream_t stream, float lse_scale,
+    const bf16* Q_rope_split, const float* Q_scales) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)
@@ -58,6 +60,13 @@ static bool launch_decode_dsv3_2_impl(
   constexpr int DYN_SMEM_BYTES = Dsv32DecodeSmem<MT>::LAUNCH_BYTES;
 
   auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS>;
+  constexpr bool GLM_H8 = MT == ModelType::GLM_NSA && NUM_HEADS == 8;
+  bool native_h8 = false;
+  if constexpr (GLM_H8) {
+    const char* native = std::getenv("FLASHINFER_GLM_H8_NATIVE");
+    native_h8 = !(native && native[0] == '0');
+    if (native_h8) kernel = sparse_mla_decode_glm_h8_kernel;
+  }
   DSV32_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
@@ -67,11 +76,17 @@ static bool launch_decode_dsv3_2_impl(
   // early after marking LSE = -1e30f — keeps mid_out/mid_lse stride aligned
   // with wrapper allocation.
   dim3 grid1(num_tokens, h_blocks, num_splits);
-  dim3 block1(DSV32_BLOCK_THREADS);
-  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
+  dim3 block1(native_h8 ? GLM_H8_THREADS : DSV32_BLOCK_THREADS);
+  // Bound PDL residency so Q producers retain resources for peer progress.
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  const bool pdl = size_t(num_tokens) * h_blocks * num_splits <= 64;
+  cudaLaunchConfig_t config{grid1, block1, DYN_SMEM_BYTES, stream, &attr, pdl ? 1u : 0u};
+  DSV32_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel,
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
       chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row,
-      flashinfer::uint_fastdiv(uint32_t(page_size)));
+      flashinfer::uint_fastdiv(uint32_t(page_size)), Q_rope_split, Q_scales));
   DSV32_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
@@ -86,19 +101,19 @@ static bool launch_decode_dsv3_2_impl(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, num_splits, q_heads, h_blocks * HPB,
       stride_out_lse, lse_scale);
   DSV32_CUDA_CHECK(cudaGetLastError());
-  return true;
+  return cudaSuccess;
 }
 
 template <ModelType MT>
 cudaError_t dispatch_dsv32_heads(const execution::AttentionParams& p,
                                  const execution::ExecutionPlan& plan, cudaStream_t stream) {
   return execution::visit_decode_heads<MT>(plan.specialized_heads, [&](auto head) {
-    launch_decode_dsv3_2_impl<MT, decltype(head)::value>(
+    return launch_decode_dsv3_2_impl<MT, decltype(head)::value>(
         p.num_heads, p.topk, p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.output,
         p.out_lse, p.attn_sink, p.num_tokens, p.allocated_splits, plan.cpb, p.sm_scale,
         p.page_stride_bytes, p.indices_stride_elems, plan.metadata.row_stride_bytes,
-        p.out_lse_stride_elems, plan.metadata.page_size, stream, p.lse_scale);
-    return cudaSuccess;
+        p.out_lse_stride_elems, plan.metadata.page_size, stream, p.lse_scale,
+        p.q_rope_split, p.q_scales);
   });
 }
 

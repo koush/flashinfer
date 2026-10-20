@@ -300,7 +300,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   const float* attn_sink_ptr =
       attn_sink.has_value() ? static_cast<const float*>(attn_sink.value().data_ptr()) : nullptr;
 
-  check_decode_scratch_capacity(q, mid_out, mid_lse, num_splits);
+  check_decode_scratch_capacity(q, mid_out, mid_lse, num_splits,
+                                num_heads == 1 || num_heads == 4 ? num_heads : 0);
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   cudaStream_t stream = get_stream(q.device());
   int sm_count = 0, max_shared = 0;
@@ -455,7 +456,8 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                               ? static_cast<const int*>(extra_lengths.value().data_ptr())
                               : nullptr;
   }
-  if (m.variant == 0) check_decode_scratch_capacity(q, mid, mlse, plan.chunk_capacity);
+  if (m.variant == 0)
+    check_decode_scratch_capacity(q, mid, mlse, plan.chunk_capacity, plan.scratch_heads);
   ffi::CUDADeviceGuard guard(q.device().device_id);
   if (m.variant != 0) {
     TVM_FFI_ICHECK(plan.numeric == execution::NumericRoute::FullBF16 ||

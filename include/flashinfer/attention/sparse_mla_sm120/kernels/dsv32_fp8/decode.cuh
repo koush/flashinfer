@@ -64,7 +64,8 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
     // Per-token advance in the KV cache. Equals KV::BYTES_PER_TOKEN for a packed
     // cache, but is larger when the caller pads rows to share one KV cache
     // group across layer geometries; the payload stays at the row start.
-    int stride_kv_row, flashinfer::uint_fastdiv page_divisor) {
+    int stride_kv_row, flashinfer::uint_fastdiv page_divisor,
+    const bf16* Q_rope_split = nullptr, const float* Q_scales = nullptr) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
@@ -230,8 +231,15 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
   const int tid = lane & 3;
 
   // Stage 0: Q quantization (rows past valid_h are zero-filled).
-  const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, DSV32_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
+  // KV/slots/lengths are independent of the preceding Q producer. IO can
+  // stage KV while the math warps wait for Q (only on bounded PDL grids).
+  if (gridDim.x * gridDim.y * gridDim.z <= 64) cudaGridDependencySynchronize();
+  const size_t q_head = (size_t)t_idx * q_heads + h_start;
+  const bf16* q_base = query_head_ptr<MT>(Q, q_head, Q_rope_split, Q_scales);
+  quantize_q_to_smem<MT, DSV32_MATH_THREADS>(
+      sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h,
+      Q_rope_split ? Q_rope_split + q_head * D_ROPE_C : nullptr,
+      Q_scales ? Q_scales + q_head * NUM_SCALES : nullptr);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -555,8 +563,9 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
           __floats2bfloat162_rn(acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
       const __nv_bfloat162 pair_hi =
           __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
-      *reinterpret_cast<__nv_bfloat162*>(
-          &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      if (gid < VALID_HPB)
+        *reinterpret_cast<__nv_bfloat162*>(
+            &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
       if constexpr (VALID_HPB > 8) {
         *reinterpret_cast<__nv_bfloat162*>(
             &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
@@ -567,7 +576,7 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
     const size_t lse_base = (size_t)t_idx * mid_heads * num_splits + (size_t)h_start * num_splits;
-    mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
+    if (gid < VALID_HPB) mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
     }

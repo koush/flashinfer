@@ -134,12 +134,13 @@ inline void check_decode_tensors(const TensorView& q, const TensorView& cache,
 }
 
 inline void check_decode_scratch_capacity(const TensorView& q, const TensorView& mid_out,
-                                          const TensorView& mid_lse, int64_t splits) {
+                                          const TensorView& mid_lse, int64_t splits,
+                                          int64_t scratch_heads = 0) {
   const int64_t tokens = q.size(0), heads = q.size(1);
   const int64_t dim = q.size(2) == KVCacheTraits<ModelType::DOTS3_SWA>::D_QK
                           ? KVCacheTraits<ModelType::DOTS3_SWA>::D_V
                           : KVCacheTraits<ModelType::DSV4>::D_V;
-  const int64_t scratch_heads = execution::decode_scratch_heads(heads);
+  if (scratch_heads == 0) scratch_heads = execution::decode_scratch_heads(heads);
   int64_t out_capacity = 1, lse_capacity = 1;
   for (int i = 0; i < mid_out.ndim(); ++i) out_capacity *= mid_out.size(i);
   for (int i = 0; i < mid_lse.ndim(); ++i) lse_capacity *= mid_lse.size(i);

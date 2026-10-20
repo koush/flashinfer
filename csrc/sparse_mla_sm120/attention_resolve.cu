@@ -1,7 +1,8 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 #include <flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h>
-#include <tvm/ffi/container/array.h>
+#include <flashinfer/exception.h>
+#include <climits>
 
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv32_fp8/resources.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/resources.cuh>
@@ -9,8 +10,10 @@
 #include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_decode/resources.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/resources.cuh>
 
+#ifndef FLASHINFER_SPARSE_MLA_STANDALONE
 #include "../tvm_ffi_utils.h"
 #include "attention_descriptor.h"
+#endif
 
 namespace flashinfer::sparse_mla_sm120::execution {
 
@@ -19,7 +22,7 @@ using kernels::dsv41_bf16::Dsv41Bf16Smem;
 
 int resolve_wave_cpb(int tokens, int head_blocks, int chunks, int requested_cpb, int sm_count) {
   if (requested_cpb >= 1 && requested_cpb <= chunks) return requested_cpb;
-  TVM_FFI_ICHECK_GT(sm_count, 0) << "SM count must be positive";
+  FLASHINFER_CHECK(sm_count > 0, "SM count must be positive");
   int cpb = 1;
   float best_gap = 2.0f;
   const int64_t per_token_head = int64_t{tokens} * head_blocks;
@@ -46,6 +49,9 @@ void decode_resources(ExecutionPlan& p) {
   if constexpr (MT == ModelType::DSV3_2 || MT == ModelType::GLM_NSA ||
                 MT == ModelType::GLM53_NOPE) {
     p.block_threads = DSV32_BLOCK_THREADS;
+    if constexpr (MT == ModelType::GLM_NSA) {
+      if (p.metadata.heads == 8) p.block_threads = 160;
+    }
     p.shared_bytes = Dsv32DecodeSmem<MT>::LAUNCH_BYTES;
   } else {
     p.block_threads = DecodeTileCfg<MT>::BASE_BLOCK_THREADS;
@@ -95,47 +101,45 @@ void prefill_resources(ExecutionPlan& p) {
 
 ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute requested,
                                 int requested_cpb, DeviceCaps caps) {
-  TVM_FFI_ICHECK(m.model >= 0 && m.model <= int(ModelType::DSV4_1_INLINE) && m.tokens > 0 &&
-                 m.heads > 0 && m.heads <= DecodeMaxHeads && m.topk > 0)
-      << "unsupported sparse-MLA attention metadata";
-  TVM_FFI_ICHECK(m.extra_topk >= 0 && m.topk <= INT_MAX - 64 - m.extra_topk &&
-                 m.tokens <= INT_MAX / 8 && (!m.has_extra_lengths || m.extra_topk > 0))
-      << "invalid attention capacity/length metadata";
-  TVM_FFI_ICHECK_GT(caps.sm_count, 0) << "SM count must be positive";
+  FLASHINFER_CHECK(m.model >= 0 && m.model <= int(ModelType::DSV4_1_INLINE) && m.tokens > 0 &&
+                   m.heads > 0 && m.heads <= DecodeMaxHeads && m.topk > 0,
+                   "unsupported sparse-MLA attention metadata");
+  FLASHINFER_CHECK(m.extra_topk >= 0 && m.topk <= INT_MAX - 64 - m.extra_topk &&
+                   m.tokens <= INT_MAX / 8 && (!m.has_extra_lengths || m.extra_topk > 0),
+                   "invalid attention capacity/length metadata");
+  FLASHINFER_CHECK(caps.sm_count > 0, "SM count must be positive");
   const auto mt = static_cast<ModelType>(m.model);
   const auto format = cache_format_info(mt);
   const bool inline_scale = format.inline_scale;
   const bool dual = m.extra_topk > 0;
   const int bpt = bytes_per_token(mt);
-  TVM_FFI_ICHECK(main_page_supported(mt, m.page_size)) << "unsupported sparse-MLA main page size";
-  TVM_FFI_ICHECK(m.row_stride_bytes >= bpt &&
-                 (inline_scale ? m.row_stride_bytes % 16 == 0 : m.row_stride_bytes == bpt))
-      << "invalid row stride";
-  TVM_FFI_ICHECK(m.page_stride_bytes >= size_t(m.page_size) * m.row_stride_bytes &&
-                 m.page_stride_bytes % 16 == 0)
-      << "invalid main page stride";
-  TVM_FFI_ICHECK(m.indices_stride >= size_t(m.topk) && m.lse_stride >= size_t(m.heads))
-      << "invalid indices/LSE stride";
-  TVM_FFI_ICHECK(!m.extra_fp4 || (is_dsv41(mt) && dual)) << "extra FP4 requires DSV41 dual cache";
-  TVM_FFI_ICHECK(!dual || mt == ModelType::DSV4 || is_dsv41(mt))
-      << "sparse-MLA has no dual-cache form";
+  FLASHINFER_CHECK(main_page_supported(mt, m.page_size), "unsupported sparse-MLA main page size");
+  FLASHINFER_CHECK(m.row_stride_bytes >= bpt &&
+                   (inline_scale ? m.row_stride_bytes % 16 == 0 : m.row_stride_bytes == bpt),
+                   "invalid row stride");
+  FLASHINFER_CHECK(m.page_stride_bytes >= size_t(m.page_size) * m.row_stride_bytes &&
+                   m.page_stride_bytes % 16 == 0, "invalid main page stride");
+  FLASHINFER_CHECK(m.indices_stride >= size_t(m.topk) && m.lse_stride >= size_t(m.heads),
+                   "invalid indices/LSE stride");
+  FLASHINFER_CHECK(!m.extra_fp4 || (is_dsv41(mt) && dual), "extra FP4 requires DSV41 dual cache");
+  FLASHINFER_CHECK(!dual || mt == ModelType::DSV4 || is_dsv41(mt),
+                   "sparse-MLA has no dual-cache form");
   const size_t extra_bpt = m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bpt;
-  TVM_FFI_ICHECK(
+  FLASHINFER_CHECK(
       !dual ||
       (main_page_supported(mt, m.extra_page_size) &&
        m.extra_indices_stride >= size_t(m.extra_topk) && m.extra_row_stride_bytes >= extra_bpt &&
        (inline_scale ? m.extra_row_stride_bytes % 16 == 0
                      : m.extra_row_stride_bytes == extra_bpt) &&
        m.extra_page_stride_bytes >= size_t(m.extra_page_size) * m.extra_row_stride_bytes &&
-       m.extra_page_stride_bytes % 16 == 0))
-      << "invalid extra page layout";
-  TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA ||
-                 m.topk >= DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW)
-      << "sparse-MLA DOTS3 requires topk >= 513";
-  TVM_FFI_ICHECK(requested != NumericRoute::NVFP4) << "wrong module for NVFP4";
-  TVM_FFI_ICHECK(requested != NumericRoute::FullBF16 ||
-                 (is_dsv41(mt) && ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)))
-      << "full BF16 requires DSV41 decode or SG prefill";
+       m.extra_page_stride_bytes % 16 == 0), "invalid extra page layout");
+  FLASHINFER_CHECK(mt != ModelType::DOTS3_SWA ||
+                   m.topk >= DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW,
+                   "sparse-MLA DOTS3 requires topk >= 513");
+  FLASHINFER_CHECK(requested != NumericRoute::NVFP4, "wrong module for NVFP4");
+  FLASHINFER_CHECK(requested != NumericRoute::FullBF16 ||
+                   (is_dsv41(mt) && ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)),
+                   "full BF16 requires DSV41 decode or SG prefill");
   ExecutionPlan p{};
   p.metadata = m;
   p.alignment = 16;
@@ -151,6 +155,8 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
     p.active_splits = (p.chunk_capacity + p.cpb - 1) / p.cpb;
     p.scratch_split_stride = p.chunk_capacity;
     p.scratch_heads = decode_scratch_heads(m.heads);
+    if ((mt == ModelType::GLM_NSA || mt == ModelType::DSV3_2 || mt == ModelType::GLM53_NOPE) &&
+        (m.heads == 1 || m.heads == 4)) p.scratch_heads = m.heads;
     p.merge = Merge::General;
     p.implementation = requested == NumericRoute::FullBF16 ? Implementation::FullBF16
                        : m.extra_fp4                       ? Implementation::MixedCache
@@ -184,35 +190,34 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
     p.block_threads = Dsv41Bf16Resources::BLOCK_THREADS;
     p.shared_bytes = sizeof(Dsv41Bf16Smem);
   } else {
-    TVM_FFI_ICHECK(m.variant >= 1 && m.variant <= 4 && m.topk % 64 == 0 &&
-                   m.indices_stride == size_t(m.topk))
-        << "invalid sparse-MLA prefill variant/topk/indices";
-    TVM_FFI_ICHECK(!dual || m.extra_indices_stride == size_t(m.extra_topk))
-        << "prefill extra indices must be dense";
+    FLASHINFER_CHECK(m.variant >= 1 && m.variant <= 4 && m.topk % 64 == 0 &&
+                     m.indices_stride == size_t(m.topk),
+                     "invalid sparse-MLA prefill variant/topk/indices");
+    FLASHINFER_CHECK(!dual || m.extra_indices_stride == size_t(m.extra_topk),
+                     "prefill extra indices must be dense");
     // DSV4_1_INLINE indices already address rows of the whole cache, so its
     // pages may be padded; the other inline formats address page slots.
-    TVM_FFI_ICHECK(!inline_scale || mt == ModelType::DSV4_1_INLINE ||
-                   m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes)
-        << "inline prefill requires contiguous pages";
-    TVM_FFI_ICHECK(has_prefill_heads(mt, m.variant, m.heads))
-        << "unsupported sparse-MLA prefill heads";
+    FLASHINFER_CHECK(!inline_scale || mt == ModelType::DSV4_1_INLINE ||
+                     m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes,
+                     "inline prefill requires contiguous pages");
+    FLASHINFER_CHECK(has_prefill_heads(mt, m.variant, m.heads), "unsupported sparse-MLA prefill heads");
     if (m.variant == 1) {
-      TVM_FFI_ICHECK(!dual || is_dsv41(mt)) << "unsupported SG dual cache";
+      FLASHINFER_CHECK(!dual || is_dsv41(mt), "unsupported SG dual cache");
       p.implementation = m.extra_fp4 ? Implementation::MixedCache : Implementation::SG;
       p.head_blocks = (m.heads + 15) / 16;
     } else if (m.variant == 4) {
-      TVM_FFI_ICHECK(!dual) << "unsupported sparse-MLA swapAB metadata";
+      FLASHINFER_CHECK(!dual, "unsupported sparse-MLA swapAB metadata");
       p.implementation = Implementation::SwapAB;
       p.head_blocks = m.heads / 64;
     } else {
-      TVM_FFI_ICHECK(m.variant == 3 ? (mt == ModelType::DSV4 && dual) : !dual)
-          << "sparse-MLA MG dual metadata mismatch";
+      FLASHINFER_CHECK(m.variant == 3 ? (mt == ModelType::DSV4 && dual) : !dual,
+                       "sparse-MLA MG dual metadata mismatch");
       p.implementation = dual && !m.has_lengths && !m.has_extra_lengths && m.extra_topk % 64 == 0
                              ? Implementation::FullTile
                              : Implementation::MG;
       if (mt == ModelType::DSV4 && (dual || m.topk <= 256)) p.numeric = NumericRoute::QkBF16PvFP8;
-      TVM_FFI_ICHECK(requested != NumericRoute::FP8 || p.numeric == NumericRoute::FP8)
-          << "explicit FP8 forbids hybrid numerical route";
+      FLASHINFER_CHECK(requested != NumericRoute::FP8 || p.numeric == NumericRoute::FP8,
+                       "explicit FP8 forbids hybrid numerical route");
       p.head_blocks = m.heads <= 16 ? 1 : m.heads / 32;
     }
     p.cpb = 1;
@@ -235,11 +240,11 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
     }
 #undef RES
   }
-  TVM_FFI_ICHECK_LE(p.shared_bytes, caps.max_shared_bytes)
-      << "shared memory exceeds device capacity";
+  FLASHINFER_CHECK(p.shared_bytes <= caps.max_shared_bytes, "shared memory exceeds device capacity");
   return p;
 }
 
+#ifndef FLASHINFER_SPARSE_MLA_STANDALONE
 ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t numeric, int64_t cpb,
                                int64_t sm_count, int64_t max_shared) {
   const auto m = unpack_metadata(values, 0);
@@ -285,7 +290,7 @@ ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64
     try {
       resolve_attention(m, numeric, 1, {1, SIZE_MAX});
       result.push_back(variant);
-    } catch (const ffi::Error&) {
+    } catch (const flashinfer::Error&) {
       // Unsupported candidates are the same failures reported by explicit
       // resolution.
     }
@@ -307,7 +312,7 @@ ffi::Map<int64_t, int64_t> metadata_candidates(ffi::Array<int64_t> values, int64
       const auto p = resolve_attention(m, static_cast<NumericRoute>(numeric), 1,
                                        {int(sm_count), size_t(max_shared)});
       result.Set(variant, p.chunk_capacity);
-    } catch (const ffi::Error&) {
+    } catch (const flashinfer::Error&) {
     }
   }
   return result;
@@ -386,8 +391,10 @@ int64_t resolve_format(int64_t query_dim, ffi::String scale) {
                             << " with kv_scale_format=" << scale;
 }
 
+#endif
 }  // namespace flashinfer::sparse_mla_sm120::execution
 
+#ifndef FLASHINFER_SPARSE_MLA_STANDALONE
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(decode_scratch_heads,
                               flashinfer::sparse_mla_sm120::execution::decode_scratch_heads);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(resolve_format,
@@ -401,4 +408,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(main_page_sizes,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(metadata_candidates,
                               flashinfer::sparse_mla_sm120::execution::metadata_candidates);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(resolve_attention,
-                              flashinfer::sparse_mla_sm120::execution::resolve_descriptor);
+                               flashinfer::sparse_mla_sm120::execution::resolve_descriptor);
+#endif

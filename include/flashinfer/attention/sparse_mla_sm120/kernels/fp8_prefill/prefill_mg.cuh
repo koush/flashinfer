@@ -258,15 +258,17 @@ __device__ __forceinline__ void prefill_mg_impl(
     // ── Quantize Q for both groups ─────────────────────────────
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++) {
-      const bf16* q_base_g =
-          Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
+      const size_t q_head = (size_t)s_i * NUM_HEADS + h_start + g * HPB;
+      const bf16* q_base_g = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
+      const bf16* q_rope_base = cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
+      const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
       if constexpr (QkMode == QkComputeMode::BF16) {
         load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * KV::D_ROPE,
-                                              q_base_g, VALID_HPB);
+                                              q_base_g, VALID_HPB, q_rope_base);
       } else {
         quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
                                              sm.q_rope() + g * HPB * KV::D_ROPE, q_base_g,
-                                             VALID_HPB);
+                                             VALID_HPB, q_rope_base, q_scales);
       }
     }
 

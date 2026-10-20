@@ -33,6 +33,7 @@
 #include "../../common/d2_load_b.cuh"
 #include "../../common/lse.cuh"
 #include "../../compute/online_softmax.cuh"
+#include "../../compute/glm_h8_qk.cuh"
 #include "../../compute/q_rope.cuh"
 #include "../../compute/q_stage.cuh"
 #include "../../compute/scale_mma.cuh"
@@ -156,12 +157,16 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   if (mwarp < QK_WARPS) {
     // ── Producer: QK + softmax + W quant ─────────────────────────
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const size_t q_head = (size_t)s_i * NUM_HEADS + h_start;
+    const bf16* q_base = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
+    const bf16* q_rope_base = cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
+    const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
 
     if constexpr (QkMode == QkComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB, q_rope_base);
     } else {
-      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB);
+      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB,
+                                        q_rope_base, q_scales);
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -516,7 +521,8 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 }
 
 template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE,
-          typename GatherSchedule = Dsv41PrefillGatherSchedule<ModelType::DSV4_1>>
+          typename GatherSchedule = Dsv41PrefillGatherSchedule<ModelType::DSV4_1>,
+          bool H8_SWAP_QK = true>
 __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS),
                                   1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -546,6 +552,10 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
 
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
   static constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
+  constexpr bool H8_SPECIALIZED = MT == ModelType::GLM_NSA && NUM_HEADS == 8;
+  constexpr bool SWAP_H8 = H8_SPECIALIZED && QkMode == QkComputeMode::FP8 && H8_SWAP_QK;
+  constexpr int ACTIVE_HPB = H8_SPECIALIZED ? 8 : HPB;
+  static_assert(!H8_SPECIALIZED || (!Cfg::SPLIT_QK_XV && !KV::V_HAS_ROPE));
   // smem layout always allocates HPB heads (zero-padded for invalid slots);
   // Q load and BF16 output / LSE write-back are gated by VALID_HPB to avoid
   // reading/writing past the caller's [num_tokens, NUM_HEADS, ...] buffers.
@@ -690,7 +700,10 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const bool qk_warp = !Cfg::SPLIT_QK_XV || mwarp < Cfg::QK_WARPS;
     const int gid = lane >> 2, tid = lane & 3;
     const float sm_scale_log2e = sm_scale * LOG2E;
-    const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
+    const size_t q_head = (size_t)s_i * NUM_HEADS + h_start;
+    const bf16* q_base = query_head_ptr<MT>(Q, q_head, cold.q_rope_split, cold.q_scales);
+    const bf16* q_rope_base = cold.q_rope_split ? cold.q_rope_split + q_head * KV::D_ROPE : nullptr;
+    const float* q_scales = cold.q_scales ? cold.q_scales + q_head * KV::NUM_SCALES : nullptr;
     const int32_t* idx_base = indices + (size_t)s_i * topk;
 
     // Candidate slice of this warp. Meaningful only for a QK warp: past
@@ -699,12 +712,14 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
 
     if constexpr (QkMode == QkComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+                                               q_rope_base);
     } else {
       quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                                VALID_HPB);
+                                                VALID_HPB, q_rope_base, q_scales);
     }
-    QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
+    QRopeRegs<MT> q_rope_regs;
+    if constexpr (!SWAP_H8) q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
     float acc_o[CT::ACC_TILES][4];
 #pragma unroll
@@ -730,12 +745,21 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       uint8_t* kv_smem = sm.kv_buf(ti & 1);
       const int32_t* ib = idx_base + ti * Cfg::BI;
 
-      for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += Cfg::MATH_THREADS)
-        sm.w_head_sc_all[i] = 0.f;
+      for (int i = threadIdx.x; i < CT::N_V_CHUNKS * ACTIVE_HPB; i += Cfg::MATH_THREADS)
+        sm.w_head_sc_all[(i / ACTIVE_HPB) * HPB + i % ACTIVE_HPB] = 0.f;
 
       float s[4] = {0.f, 0.f, 0.f, 0.f};
       bool valid0 = false, valid1 = false;
-      if (qk_warp) {
+      if constexpr (SWAP_H8) {
+        static_assert(Cfg::BI == 64 && Cfg::QK_WARPS == 8);
+        static_assert(CT::N_V_CHUNKS * L::SMEM_W_FP8_ONE >= 64 * 8 * sizeof(float));
+        if (mwarp < 4)
+          flashinfer::sparse_mla_sm120::glm_h8_prefill_qk<PAGE_BLOCK_SIZE>(
+              reinterpret_cast<float*>(sm.w_fp8), sm.reduce_buf, sm.q_nope_fp8, sm.q_nope_sc,
+              sm.q_rope, kv_smem, KV_cache, ib, kv_stride_bytes, topk_len - ti * Cfg::BI,
+              sm_scale_log2e, mwarp, lane);
+      }
+      if (qk_warp && !SWAP_H8) {
         uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
         const int idx_rope =
@@ -798,17 +822,31 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         // ── Online softmax, warp-local half ──────────────────
         s[0] = valid0 ? qk[0] * sm_scale_log2e : -1e30f;
         s[1] = valid1 ? qk[1] * sm_scale_log2e : -1e30f;
-        s[2] = valid0 ? qk[2] * sm_scale_log2e : -1e30f;
-        s[3] = valid1 ? qk[3] * sm_scale_log2e : -1e30f;
-
-        float lm0, lm1;
-        softmax_warp_max(s, lm0, lm1);
+        float lm0, lm1 = -1e30f;
+        if constexpr (H8_SPECIALIZED) {
+          lm0 = fmaxf(s[0], s[1]);
+          lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 1));
+          lm0 = fmaxf(lm0, __shfl_xor_sync(0xffffffff, lm0, 2));
+        } else {
+          s[2] = valid0 ? qk[2] * sm_scale_log2e : -1e30f;
+          s[3] = valid1 ? qk[3] * sm_scale_log2e : -1e30f;
+          softmax_warp_max(s, lm0, lm1);
+        }
         if (tid == 0) {
           sm.reduce_buf[mwarp * HPB + gid] = lm0;
-          sm.reduce_buf[mwarp * HPB + gid + 8] = lm1;
+          if constexpr (!H8_SPECIALIZED) sm.reduce_buf[mwarp * HPB + gid + 8] = lm1;
         }
       }  // qk_warp
       bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
+
+      if constexpr (SWAP_H8) {
+        const float* scores = reinterpret_cast<const float*>(sm.w_fp8);
+        const int c = qk_nb + tid * 2;
+        s[0] = scores[c * 8 + gid];
+        s[1] = scores[(c + 1) * 8 + gid];
+        valid0 = ti * Cfg::BI + c < topk_len && ib[c] >= 0;
+        valid1 = ti * Cfg::BI + c + 1 < topk_len && ib[c + 1] >= 0;
+      }
 
       // Redundant per-thread reduction over the QK warps' row maxima. Every
       // math thread holds heads gid and gid+8, so each reads QK_WARPS pairs
@@ -816,22 +854,28 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       // keep this bitwise-equal to the old single-warp reduction.
       float tm0 = -1e30f, tm1 = -1e30f;
 #pragma unroll
-      for (int w = 0; w < Cfg::QK_WARPS; w++) {
+      for (int w = 0; w < (SWAP_H8 ? 4 : Cfg::QK_WARPS); w++) {
         tm0 = fmaxf(tm0, sm.reduce_buf[w * HPB + gid]);
-        tm1 = fmaxf(tm1, sm.reduce_buf[w * HPB + gid + 8]);
+        if constexpr (!H8_SPECIALIZED) tm1 = fmaxf(tm1, sm.reduce_buf[w * HPB + gid + 8]);
       }
-      float nm0 = fmaxf(m0, tm0), nm1 = fmaxf(m1, tm1);
-      float alpha0 = exp2f(m0 - nm0), alpha1 = exp2f(m1 - nm1);
+      float nm0 = fmaxf(m0, tm0), nm1 = -1e30f;
+      float alpha0 = exp2f(m0 - nm0), alpha1 = 1.f;
       m0 = nm0;
-      m1 = nm1;
+      if constexpr (!H8_SPECIALIZED) {
+        nm1 = fmaxf(m1, tm1);
+        alpha1 = exp2f(m1 - nm1);
+        m1 = nm1;
+      }
 
       if (alpha0 < 1.0f || alpha1 < 1.0f) {
 #pragma unroll
         for (int t = 0; t < CT::ACC_TILES; t++) {
           acc_o[t][0] *= alpha0;
           acc_o[t][1] *= alpha0;
-          acc_o[t][2] *= alpha1;
-          acc_o[t][3] *= alpha1;
+          if constexpr (!H8_SPECIALIZED) {
+            acc_o[t][2] *= alpha1;
+            acc_o[t][3] *= alpha1;
+          }
         }
         if constexpr (V_ROPE) {
           acc_rope[0] *= alpha0;
@@ -840,7 +884,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
           acc_rope[3] *= alpha1;
         }
         warp_l[0] *= alpha0;
-        warp_l[1] *= alpha1;
+        if constexpr (!H8_SPECIALIZED) warp_l[1] *= alpha1;
       }
 
       // The softmax weights and the per-entry V scales belong to the warp's own
@@ -851,13 +895,18 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       if (qk_warp) {
         w0 = valid0 ? exp2f(s[0] - nm0) : 0.f;
         w1 = valid1 ? exp2f(s[1] - nm0) : 0.f;
-        w2 = valid0 ? exp2f(s[2] - nm1) : 0.f;
-        w3 = valid1 ? exp2f(s[3] - nm1) : 0.f;
-
-        float ls0, ls1;
-        softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
+        float ls0, ls1 = 0.f;
+        if constexpr (H8_SPECIALIZED) {
+          ls0 = w0 + w1;
+          ls0 += __shfl_xor_sync(0xffffffff, ls0, 1);
+          ls0 += __shfl_xor_sync(0xffffffff, ls0, 2);
+        } else {
+          w2 = valid0 ? exp2f(s[2] - nm1) : 0.f;
+          w3 = valid1 ? exp2f(s[3] - nm1) : 0.f;
+          softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
+        }
         warp_l[0] += ls0;
-        warp_l[1] += ls1;
+        if constexpr (!H8_SPECIALIZED) warp_l[1] += ls1;
 
         // ── V scale cache + atomicMax ───────────────────────────
         const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
@@ -874,17 +923,23 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
                                    : sm.kv_scale_buf(ti & 1) + e1i * KV::SCALE_BYTES_PER_TOKEN,
               vc);
           float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
-          float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
                     __float_as_int(fmaxf(ws00, ws01)));
-          atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(ws10, ws11)));
+          if constexpr (!H8_SPECIALIZED) {
+            float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
+            atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
+                      __float_as_int(fmaxf(ws10, ws11)));
+          }
         }
       }
       bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
 
-      for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += Cfg::MATH_THREADS)
-        sm.w_head_sc_all[i] = fmaxf(sm.w_head_sc_all[i], 1e-10f) / FP8_MAX;
+      for (int i = threadIdx.x; i < CT::N_V_CHUNKS * ACTIVE_HPB; i += Cfg::MATH_THREADS) {
+        const int vc = i / ACTIVE_HPB, h = i % ACTIVE_HPB;
+        const float scale = fmaxf(sm.w_head_sc_all[vc * HPB + h], 1e-10f) / FP8_MAX;
+        sm.w_head_sc_all[vc * HPB + h] = scale;
+        if constexpr (H8_SPECIALIZED) sm.w_head_sc_all[vc * HPB + h + 8] = 1.f / scale;
+      }
       bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
 
       // ── XV nope MMA (D2: direct B from kv_smem) ───────────
@@ -902,16 +957,29 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
           for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
             float* vc_sc = sm.w_head_sc_all + vc * HPB;
             uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
-            float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+            float si0 = H8_SPECIALIZED ? vc_sc[gid + 8] : 1.f / vc_sc[gid];
             float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
             float wn00 = w0 * vsc0 * si0, wn01 = w1 * vsc1 * si0;
-            float wn10 = w2 * vsc0 * si1, wn11 = w3 * vsc1 * si1;
+            float wn10 = 0.f, wn11 = 0.f;
+            if constexpr (!H8_SPECIALIZED) {
+              const float si1 = 1.f / vc_sc[gid + 8];
+              wn10 = w2 * vsc0 * si1;
+              wn11 = w3 * vsc1 * si1;
+            }
             float xv_acc[CT::NT_PER_WARP_XV][4] = {0};
 #pragma unroll
-            for (int wpass = 0; wpass < 2; ++wpass) {
+            for (int wpass = 0; wpass < (H8_SPECIALIZED ? 1 : 2); ++wpass) {
               if (wpass > 0) bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
-              Fp8WeightQuad wq =
-                  quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+              Fp8WeightQuad wq;
+              if constexpr (H8_SPECIALIZED) {
+                // Pack high/residual probabilities into the two eight-row halves.
+                wq = {quantize_weight_e4m3_for_pass<KV::SCALE_FORMAT>(wn00, 0),
+                      quantize_weight_e4m3_for_pass<KV::SCALE_FORMAT>(wn01, 0),
+                      quantize_weight_e4m3_for_pass<KV::SCALE_FORMAT>(wn00, 1),
+                      quantize_weight_e4m3_for_pass<KV::SCALE_FORMAT>(wn01, 1)};
+              } else {
+                wq = quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+              }
               wfp8[gid * CT::W_FP8_STRIDE + e0i] = wq.h0_e0;
               wfp8[gid * CT::W_FP8_STRIDE + e1i] = wq.h0_e1;
               wfp8[(gid + 8) * CT::W_FP8_STRIDE + e0i] = wq.h1_e0;
@@ -928,11 +996,17 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
 #pragma unroll
             for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
               int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-              float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
-              acc_o[ti_acc][0] += xv_acc[nt][0] * sc0;
-              acc_o[ti_acc][1] += xv_acc[nt][1] * sc0;
-              acc_o[ti_acc][2] += xv_acc[nt][2] * sc1;
-              acc_o[ti_acc][3] += xv_acc[nt][3] * sc1;
+              float sc0 = vc_sc[gid];
+              if constexpr (H8_SPECIALIZED) {
+                acc_o[ti_acc][0] += (xv_acc[nt][0] + xv_acc[nt][2]) * sc0;
+                acc_o[ti_acc][1] += (xv_acc[nt][1] + xv_acc[nt][3]) * sc0;
+              } else {
+                float sc1 = vc_sc[gid + 8];
+                acc_o[ti_acc][0] += xv_acc[nt][0] * sc0;
+                acc_o[ti_acc][1] += xv_acc[nt][1] * sc0;
+                acc_o[ti_acc][2] += xv_acc[nt][2] * sc1;
+                acc_o[ti_acc][3] += xv_acc[nt][3] * sc1;
+              }
             }
           }
         } else {
@@ -1010,7 +1084,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // the epilogue. Threads sharing a gid computed identical values.
     if (tid == 0) {
       sm.m_smem[gid] = m0;
-      sm.m_smem[gid + 8] = m1;
+      if constexpr (!H8_SPECIALIZED) sm.m_smem[gid + 8] = m1;
     }
 
     // ── Finalize deferred row_sum ────────────────────────────────
@@ -1018,10 +1092,10 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // touched warp_l and must not write a slot the reduction below reads.
     if (qk_warp && tid == 0) {
       sm.reduce_buf[mwarp * HPB + gid] = warp_l[0];
-      sm.reduce_buf[mwarp * HPB + gid + 8] = warp_l[1];
+      if constexpr (!H8_SPECIALIZED) sm.reduce_buf[mwarp * HPB + gid + 8] = warp_l[1];
     }
     bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
-    if (threadIdx.x < HPB) {
+    if (threadIdx.x < ACTIVE_HPB) {
       int h = threadIdx.x;
       float ts = 0.f;
 #pragma unroll
@@ -1034,7 +1108,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // The sink denominator and accumulator use the same max frame.
     float il0, il1;
     if (cold.attn_sink != nullptr) {
-      float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
+      float s0 = gid < VALID_HPB ? __ldg(cold.attn_sink + h_start + gid) * LOG2E : -1e30f;
       float peak0 = fmaxf(s0, sm.m_smem[gid]);
       float weight0 = exp2f(sm.m_smem[gid] - peak0);
       float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
@@ -1050,7 +1124,8 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       }
     } else {
       il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
-      il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
+      if constexpr (H8_SPECIALIZED) il1 = 0.f;
+      else il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;
     }
 
     // The main loop is done with the KV double buffer, so its first half is
@@ -1069,8 +1144,10 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       int d0 = c * CT::V_CHUNK + mwarp * _NT8 + lnt * 8 + tid * 2;
       staging_bf16[gid * BF16_STAGING_STRIDE + d0] = __float2bfloat16(acc_o[t][0] * il0);
       staging_bf16[gid * BF16_STAGING_STRIDE + d0 + 1] = __float2bfloat16(acc_o[t][1] * il0);
-      staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0] = __float2bfloat16(acc_o[t][2] * il1);
-      staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0 + 1] = __float2bfloat16(acc_o[t][3] * il1);
+      if constexpr (!H8_SPECIALIZED) {
+        staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0] = __float2bfloat16(acc_o[t][2] * il1);
+        staging_bf16[(gid + 8) * BF16_STAGING_STRIDE + d0 + 1] = __float2bfloat16(acc_o[t][3] * il1);
+      }
     }
 
     if constexpr (V_ROPE) {

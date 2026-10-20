@@ -3,7 +3,6 @@
 
 #include <flashinfer/attention/sparse_mla_sm120/execution/decode_launch.cuh>
 
-#include "../tvm_ffi_utils.h"
 #include "attention_dispatch.h"
 
 namespace flashinfer::sparse_mla_sm120 {

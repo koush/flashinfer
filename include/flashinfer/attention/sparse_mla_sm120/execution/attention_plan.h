@@ -32,6 +32,9 @@ PrefillLaunchResult visit_prefill_heads(int heads, F&& call) {
   constexpr bool swap = Variant == 4;
 #define HEAD(H) \
   if (heads == H) return call(std::integral_constant<int, H>{});
+  if constexpr (sg && inline_scale) {
+    HEAD(1) HEAD(4)
+  }
   if constexpr ((sg && (inline_scale || is_dsv41(MT) || MT == ModelType::DOTS3_SWA)) ||
                 (mg && MT == ModelType::DSV4)) {
     HEAD(8) HEAD(16)
@@ -85,6 +88,11 @@ template <ModelType MT, typename F>
 auto visit_decode_heads(int heads, F&& call) {
 #define HEAD(H) \
   if (heads == H) return call(std::integral_constant<int, H>{});
+  if constexpr (MT == ModelType::GLM_NSA || MT == ModelType::DSV3_2 ||
+                MT == ModelType::GLM53_NOPE) {
+    HEAD(1);
+    HEAD(4);
+  }
   HEAD(8);
   HEAD(16);
   HEAD(32);
