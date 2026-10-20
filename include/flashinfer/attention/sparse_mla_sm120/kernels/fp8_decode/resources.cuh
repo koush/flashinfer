@@ -40,14 +40,15 @@ struct DecodeTilePrimary<ModelType::DOTS3_SWA> {
   static constexpr int WINDOW = KVCacheTraits<ModelType::DOTS3_SWA>::WINDOW;
 };
 
-template <ModelType MT, bool MIXED_PIPELINE = false>
+template <ModelType MT, bool MIXED_PIPELINE = false, int MATH_WARPS = 0>
 struct DecodeTileCfg {
   using P = DecodeTilePrimary<MT>;
   using KV = KVCacheTraits<MT>;
   static constexpr int MATH_BARRIER = 3;
   using MixedPlan = kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources;
   static constexpr int N_WARPS =
-      MIXED_PIPELINE ? MixedPlan::MATH_THREADS / MixedPlan::WARP_THREADS : P::N_WARPS;
+      MIXED_PIPELINE ? MixedPlan::MATH_THREADS / MixedPlan::WARP_THREADS
+                     : MATH_WARPS ? MATH_WARPS : P::N_WARPS;
   static constexpr int IO_WARPS = P::IO_WARPS;
   static constexpr int CAND_WINDOW = MIXED_PIPELINE ? MixedPlan::BI : P::CAND_WINDOW;
   static constexpr int KV_BUF_COUNT = P::KV_BUF_COUNT;
@@ -95,10 +96,10 @@ struct DecodeTileCfg {
   }
 };
 
-template <ModelType MT, bool MIXED_PIPELINE = false>
+template <ModelType MT, bool MIXED_PIPELINE = false, int MATH_WARPS = 0>
 struct Fp8DecodeSharedLayout {
   using KV = KVCacheTraits<MT>;
-  using Cfg = DecodeTileCfg<MT, MIXED_PIPELINE>;
+  using Cfg = DecodeTileCfg<MT, MIXED_PIPELINE, MATH_WARPS>;
   // This layout serves the UE8M0-scaled models. The footer-scale ones (DSV4,
   // DOTS3_SWA, DSV4_1) keep a KV smem region holding nope only and gather
   // their scales into a separate kv_sc buffer; DSV4_1_INLINE bulk-copies each

@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include <cstdlib>
-
 #include "../kernels/dsv41_bf16/decode.cuh"
 #include "../kernels/dsv41_fp8/decode_schedule.cuh"
 #include "../kernels/fp8_decode/decode.cuh"
@@ -24,10 +22,7 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   const int block_threads = plan.block_threads;
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
   if constexpr (MT == ModelType::DSV4 && NUM_HEADS == 8) {
-    const char* prune = std::getenv("FLASHINFER_DSV4_H8_PRUNE");
-    if (prune && prune[0] == '0') {
-      kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, false>;
-    }
+    kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, 4>;
   }
   // Inline-scale rows are addressed flat: the stride arguments carry the main
   // and extra row pitches.

@@ -47,9 +47,9 @@ namespace flashinfer::sparse_mla_sm120 {
 // and an unconstrained register budget avoids the spill forced by that hint.
 // The mixed schedule supplies its own launch bound.
 template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule,
-          bool PRUNE_H8 = true>
+          int MATH_WARPS = 0>
 __global__ void __launch_bounds__(
-    (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>::template block_threads<GatherSchedule>()),
+    (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE, MATH_WARPS>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
     sparse_mla_decode_dsv4_kernel(
         const bf16* __restrict__ Q,  // [num_tokens, num_heads, d_qk] bf16
@@ -78,7 +78,7 @@ __global__ void __launch_bounds__(
             std::conditional_t<MT == ModelType::DOTS3_SWA, flashinfer::uint_fastdiv, int>>
             pages) {
   using KV = KVCacheTraits<MT>;
-  using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>;
+  using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE, MATH_WARPS>;
   static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || is_dsv41(MT),
                 "decode-dsv4 serves the UE8M0-scaled model types (DSV4, DOTS3_SWA, DSV4_1, "
                 "DSV4_1_INLINE)");
@@ -216,7 +216,7 @@ __global__ void __launch_bounds__(
   // Plus static sm_p_full HPB * Cfg::BI * 2B (bf16) = 2 KB.
   // Grand total ~ 90 KB (under 100 KB SM120 carveout, 1 block/SM).
   extern __shared__ __align__(16) char smem_raw[];
-  using Layout = Fp8DecodeSharedLayout<MT, GatherSchedule::RAW_PIPELINE>;
+  using Layout = Fp8DecodeSharedLayout<MT, GatherSchedule::RAW_PIPELINE, MATH_WARPS>;
   auto sm = Layout::init(smem_raw);
   constexpr size_t RAW_OFFSET = Layout::OFF_W_FP8 + Layout::W_FP8_SLOTS * Layout::SMEM_W_FP8_BUF;
 
@@ -460,10 +460,13 @@ __global__ void __launch_bounds__(
 
     // ── Stage 2 QK ────────────────────────────────────────────
     float qk[Cfg::QK_N_TILES][4] = {0};
-    static_assert(Cfg::QK_N_TILES == 1);
-    qk_fp8_nope_16x8<KV>(qk[0], sm.q_fp8(), sm.q_sc(),
-                         sm_kv_fp8 + (size_t)warp_id * Cfg::ENTRIES_PER_WARP * KV_SMEM_STRIDE,
-                         sm_kv_sc + warp_id * Cfg::ENTRIES_PER_WARP * SCALE_STRIDE, lane);
+#pragma unroll
+    for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
+      const int first = warp_id * Cfg::ENTRIES_PER_WARP + nt * 8;
+      qk_fp8_nope_16x8<KV>(qk[nt], sm.q_fp8(), sm.q_sc(),
+                           sm_kv_fp8 + (size_t)first * KV_SMEM_STRIDE,
+                           sm_kv_sc + first * SCALE_STRIDE, lane);
+    }
     {
       // K-rope B operand: scalar per-lane reads. mma.m16n8k16 needs each lane's
       // b0/b1 to hold consecutive K-rows of one N-entry, which ldmatrix.x2.trans
@@ -630,7 +633,7 @@ __global__ void __launch_bounds__(
     for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       w_pre[nt][0] = p[nt][0] * warp_rescale0;
       w_pre[nt][1] = p[nt][1] * warp_rescale0;
-      if constexpr (PRUNE_H8 && MT == ModelType::DSV4 && NUM_HEADS == 8) {
+      if constexpr (MT == ModelType::DSV4 && NUM_HEADS == 8) {
         w_pre[nt][2] = 0.f;
         w_pre[nt][3] = 0.f;
       } else {
@@ -672,7 +675,7 @@ __global__ void __launch_bounds__(
                     __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
           // DSV4 TP8 has only the lower eight head rows. The upper MMA
           // rows are discarded, so they need no probability-scale reduction.
-          if constexpr (!PRUNE_H8 || MT != ModelType::DSV4 || NUM_HEADS != 8) {
+          if constexpr (MT != ModelType::DSV4 || NUM_HEADS != 8) {
             atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
                       __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
           }

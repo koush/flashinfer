@@ -56,6 +56,12 @@ void decode_resources(ExecutionPlan& p) {
   } else {
     p.block_threads = DecodeTileCfg<MT>::BASE_BLOCK_THREADS;
     p.shared_bytes = Fp8DecodeSharedLayout<MT>::TOTAL_BYTES;
+    if constexpr (MT == ModelType::DSV4) {
+      if (p.specialized_heads == 8) {
+        p.block_threads = DecodeTileCfg<MT, false, 4>::BASE_BLOCK_THREADS;
+        p.shared_bytes = Fp8DecodeSharedLayout<MT, false, 4>::TOTAL_BYTES;
+      }
+    }
     if constexpr (is_dsv41(MT)) {
       if (p.implementation == Implementation::MixedCache) {
         p.block_threads = kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources::BLOCK_THREADS;

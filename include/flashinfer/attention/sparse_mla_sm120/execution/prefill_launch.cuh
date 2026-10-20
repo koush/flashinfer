@@ -44,7 +44,6 @@
 // freezes the executable route. These launchers consume that resolved plan.
 
 #include <cuda_runtime.h>
-#include <cstdlib>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 
 #pragma once
@@ -116,19 +115,12 @@ PrefillLaunchResult launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache,
   dim3 block(Resources::BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_kernel<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, GatherSchedule>;
-  bool h8_swapped = true;
-  if constexpr (MT == ModelType::GLM_NSA && NUM_HEADS == 8 && QkMode == QkComputeMode::FP8) {
-    const char* swap = std::getenv("FLASHINFER_GLM_H8_PREFILL_SWAP_QK");
-    h8_swapped = !(swap && swap[0] == '0');
-    if (!h8_swapped)
-      kernel = sparse_mla_prefill_kernel<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, GatherSchedule, false>;
-  }
-  static bool configured[2][kMaxCachedCudaDevices] = {};
+  static bool configured[kMaxCachedCudaDevices] = {};
   if constexpr (GatherSchedule::RAW_PIPELINE) {
     const cudaError_t result = execution::validate_mixed_smem(kernel, smem_bytes);
     if (result != cudaSuccess) return {result, "validate_mixed_smem"};
   }
-  const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured[h8_swapped]);
+  const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
   if (configured_result.error != cudaSuccess) return configured_result;
 
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};

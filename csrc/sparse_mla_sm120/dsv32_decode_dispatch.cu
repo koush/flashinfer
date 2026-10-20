@@ -13,7 +13,6 @@
 // instantiation serves every indices-row width.
 
 #include <cuda_runtime.h>
-#include <cstdlib>
 
 #include <flashinfer/attention/sparse_mla_sm120/execution/merge.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv32_fp8/decode.cuh>
@@ -61,11 +60,8 @@ static cudaError_t launch_decode_dsv3_2_impl(
 
   auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS>;
   constexpr bool GLM_H8 = MT == ModelType::GLM_NSA && NUM_HEADS == 8;
-  bool native_h8 = false;
   if constexpr (GLM_H8) {
-    const char* native = std::getenv("FLASHINFER_GLM_H8_NATIVE");
-    native_h8 = !(native && native[0] == '0');
-    if (native_h8) kernel = sparse_mla_decode_glm_h8_kernel;
+    kernel = sparse_mla_decode_glm_h8_kernel;
   }
   DSV32_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
@@ -76,7 +72,7 @@ static cudaError_t launch_decode_dsv3_2_impl(
   // early after marking LSE = -1e30f — keeps mid_out/mid_lse stride aligned
   // with wrapper allocation.
   dim3 grid1(num_tokens, h_blocks, num_splits);
-  dim3 block1(native_h8 ? GLM_H8_THREADS : DSV32_BLOCK_THREADS);
+  dim3 block1(GLM_H8 ? GLM_H8_THREADS : DSV32_BLOCK_THREADS);
   // Bound PDL residency so Q producers retain resources for peer progress.
   cudaLaunchAttribute attr{};
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;

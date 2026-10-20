@@ -50,10 +50,9 @@ also use power-of-two scales; upstream swapAB's online GLM quantizer uses
 arbitrary FP32 scales. Compare each route against attention on its actual
 quantized input, rather than requiring bitwise equality between those quantizers.
 
-`FLASHINFER_GLM_H8_NATIVE=0` selects generic H8 decode.
-`FLASHINFER_GLM_H8_PREFILL_SWAP_QK=0` selects conventional H8 QK while retaining
-padded-head pruning and packed PV. Defaults enable both specializations.
-Recreate captured graphs after changing either variable.
+GLM H8 uses specialized decode and candidate-major prefill QK unconditionally,
+including padded-head pruning and packed PV. Experimental environment overrides
+have been removed; tests compare against FP32 attention and graph replay.
 
 H8 ports preserve upstream's zero-row handling for masked cache reads, including
 stale indices beyond the per-row length, and upstream's named pipeline barriers.
@@ -63,9 +62,8 @@ stale indices beyond the per-row length, and upstream's named pipeline barriers.
 The DSV4 H8 decode specialization zeros discarded probability rows before
 quantization and omits their probability-scale atomics. This covers the parent
 DeepSeek V4.1 TP8 single-/dual-cache decode path, which uses `ModelType::DSV4`.
-`FLASHINFER_DSV4_H8_PRUNE=0` restores the original kernel for A/B measurements;
-pruning is enabled by default. Recreate CUDA graphs (or restart the executor)
-after changing this variable.
+Pruning is unconditional for DSV4 H8; its experimental environment override
+has been removed.
 
 Alternating same-process graph-replay microbenchmarks measured a 1.0–1.6%
 decode-plus-merge latency reduction for H8, 1/4/8/16 query rows, and 128, 512,
@@ -74,6 +72,26 @@ measurements, not cold-cache or full-model throughput results. All 24 H8/H16
 cases had bitwise-identical output/LSE, including sinks, invalid indices,
 partial lengths and empty rows; Compute Sanitizer memcheck reported zero
 errors. The parent's TP1/TP2 native-wrapper reference tests also pass.
+
+H8 decode uses four math warps plus one IO warp while
+retaining the 64-candidate tile and split geometry. Each math warp computes
+two QK candidate tiles. The execution planner supplies the specialized launch
+dimensions and shared-memory size. The experimental four-warp environment
+override has been removed. Before removing the A/B switches, alternating warm graph replays
+measured approximately 3.0–3.7% lower H8 decode-plus-merge latency, with H16
+controls unchanged. Reduction order changes: maximum observed output delta
+was 0.000244141, and LSE comparisons passed with absolute tolerance 2e-6.
+Both variants passed an independent FP32 attention reference (output atol
+0.005, rtol 0.05), including sinks, masking and single/dual caches. All 24
+H8/H16 cases passed eager-versus-graph checks; TP1/TP2 wrapper tests passed.
+Targeted memcheck covered six H8 cases (1/16 rows, 128/512/128+512 candidates)
+with zero errors after the broader sanitizer run exceeded its time limit.
+
+Rejected experiments, reverted before the four-warp trial:
+- Four-lane maximum reduction before scale atomics: bitwise-correct but
+  2.7–3.4% slower than the probability-pruned baseline.
+- Removing padded-head softmax shared stores/loads: bitwise-correct but
+  0.3–1.0% slower than the probability-pruned baseline.
 
 ## Validation
 

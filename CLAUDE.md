@@ -829,9 +829,9 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 See `FORK.md` for the sparse-query and compact-head native interface extensions.
 `FLASHINFER_SPARSE_MLA_STANDALONE` builds the resolver without TVM exports.
-`FLASHINFER_GLM_H8_NATIVE=0` selects generic H8 decode;
-`FLASHINFER_GLM_H8_PREFILL_SWAP_QK=0` selects conventional H8 QK. Both default
-to the specialized route. Recreate CUDA graphs when changing these settings.
+GLM H8 decode and candidate-major prefill QK use the specialized routes
+unconditionally. Use environment overrides for experiments only; remove them
+before committing an accepted optimization.
 The old H8 direct-KV toggle is superseded by upstream's shared-memory layout.
 
 ##### Experimental KDA Output-Only Decode Tuning
